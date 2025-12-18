@@ -7,6 +7,7 @@
 
 import Foundation
 import PDFKit
+import UIKit
 
 @MainActor
 class DocumentService: ObservableObject {
@@ -41,23 +42,47 @@ class DocumentService: ObservableObject {
                     fileURL: url
                 )
             }
-            .sorted { $0.createdAt > $1.createdAt } // Newest first
+            .sorted { $0.createdAt > $1.createdAt }
     }
     
+    // MARK: - COMPRESSED SAVE FUNCTION
     func savePDF(_ pdfDocument: PDFDocument, filterType: FilterType = .blackAndWhite) throws -> Document {
         let fileName = Document.generateFileName()
         let fileURL = documentsDirectory.appendingPathComponent(fileName)
         
-        // Apply filter to PDF pages
-        let processedPDF = applyFilter(to: pdfDocument, filterType: filterType)
+        // 1. Create a NEW PDF for the compressed output
+        let compressedPDF = PDFDocument()
         
-        // Save PDF
-        guard processedPDF.write(to: fileURL) else {
+        // 2. Loop through pages and compress each one
+        for i in 0..<pdfDocument.pageCount {
+            guard let page = pdfDocument.page(at: i) else { continue }
+            
+            // Get the image from the page
+            let pageRect = page.bounds(for: .mediaBox)
+            let renderer = UIGraphicsImageRenderer(size: pageRect.size)
+            let image = renderer.image { ctx in
+                UIColor.white.set()
+                ctx.fill(pageRect)
+                ctx.cgContext.translateBy(x: 0, y: pageRect.height)
+                ctx.cgContext.scaleBy(x: 1.0, y: -1.0)
+                page.draw(with: .mediaBox, to: ctx.cgContext)
+            }
+            
+            // 3. COMPRESSION MAGIC (0.7 quality is the sweet spot)
+            if let compressedData = image.jpegData(compressionQuality: 0.7),
+               let compressedImage = UIImage(data: compressedData),
+               let newPage = PDFPage(image: compressedImage) {
+                compressedPDF.insert(newPage, at: compressedPDF.pageCount)
+            }
+        }
+        
+        // 4. Save the smaller PDF
+        guard compressedPDF.write(to: fileURL) else {
             throw DocumentError.saveFailed
         }
         
         let document = Document(fileName: fileName, fileURL: fileURL)
-        documents.insert(document, at: 0) // Insert at beginning (newest first)
+        documents.insert(document, at: 0)
         return document
     }
     
@@ -71,7 +96,6 @@ class DocumentService: ObservableObject {
         let newURL = documentsDirectory.appendingPathComponent(newName)
         let fileManager = FileManager.default
         
-        // Check if new name already exists
         if fileManager.fileExists(atPath: newURL.path) {
             throw DocumentError.nameExists
         }
@@ -87,90 +111,13 @@ class DocumentService: ObservableObject {
             )
         }
     }
-    
-    func applyFilter(to pdfDocument: PDFDocument, filterType: FilterType) -> PDFDocument {
-        guard filterType != .color else {
-            return pdfDocument // No processing needed for color
-        }
-        
-        let filteredPDF = PDFDocument()
-        
-        for pageIndex in 0..<pdfDocument.pageCount {
-            guard let page = pdfDocument.page(at: pageIndex) else { continue }
-            
-            let pageRect = page.bounds(for: .mediaBox)
-            // Use opaque rendering to avoid alpha channel issues
-            let renderer = UIGraphicsImageRenderer(size: pageRect.size)
-            
-            let image = renderer.image { context in
-                context.cgContext.translateBy(x: 0, y: pageRect.height)
-                context.cgContext.scaleBy(x: 1.0, y: -1.0)
-                page.draw(with: .mediaBox, to: context.cgContext)
-            }
-            
-            let filteredImage = applyFilter(to: image, filterType: filterType)
-            
-            // Convert to non-alpha image to avoid PDF warnings
-            if let cgImage = filteredImage.cgImage {
-                let colorSpace = CGColorSpaceCreateDeviceRGB()
-                let context = CGContext(
-                    data: nil,
-                    width: cgImage.width,
-                    height: cgImage.height,
-                    bitsPerComponent: 8,
-                    bytesPerRow: 0,
-                    space: colorSpace,
-                    bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
-                )
-                
-                if let context = context {
-                    context.draw(cgImage, in: CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height))
-                    if let finalImage = context.makeImage() {
-                        let uiImage = UIImage(cgImage: finalImage)
-                        if let filteredPage = PDFPage(image: uiImage) {
-                            filteredPDF.insert(filteredPage, at: filteredPDF.pageCount)
-                        }
-                    }
-                }
-            }
-        }
-        
-        return filteredPDF
-    }
-    
-    private func applyFilter(to image: UIImage, filterType: FilterType) -> UIImage {
-        guard let cgImage = image.cgImage else { return image }
-        
-        let context = CIContext(options: nil)
-        let ciImage = CIImage(cgImage: cgImage)
-        
-        let filter: CIFilter?
-        
-        switch filterType {
-        case .blackAndWhite:
-            // High contrast black and white
-            filter = CIFilter(name: "CIColorControls")
-            filter?.setValue(ciImage, forKey: kCIInputImageKey)
-            filter?.setValue(1.5, forKey: kCIInputContrastKey) // High contrast
-            filter?.setValue(0.0, forKey: kCIInputSaturationKey) // Remove color
-            
-        case .grayscale:
-            filter = CIFilter(name: "CIColorControls")
-            filter?.setValue(ciImage, forKey: kCIInputImageKey)
-            filter?.setValue(0.0, forKey: kCIInputSaturationKey) // Remove color
-            
-        case .color:
-            return image
-        }
-        
-        guard let filter = filter,
-              let outputImage = filter.outputImage,
-              let cgImage = context.createCGImage(outputImage, from: outputImage.extent) else {
-            return image
-        }
-        
-        return UIImage(cgImage: cgImage)
-    }
+}
+
+enum FilterType {
+    case original
+    case blackAndWhite
+    case grayscale
+    case color
 }
 
 enum DocumentError: LocalizedError {
@@ -179,11 +126,8 @@ enum DocumentError: LocalizedError {
     
     var errorDescription: String? {
         switch self {
-        case .saveFailed:
-            return "Failed to save document"
-        case .nameExists:
-            return "A document with this name already exists"
+        case .saveFailed: return "Failed to save document"
+        case .nameExists: return "A document with this name already exists"
         }
     }
 }
-

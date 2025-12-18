@@ -13,7 +13,6 @@ import UIKit
 struct HomeView: View {
     @StateObject private var documentService = DocumentService.shared
     @StateObject private var signatureService = SignatureService.shared
-    @State private var showScanner = false
     @State private var showSettings = false
     @State private var scannedImages: [UIImage]?
     @State private var selectedDocument: Document?
@@ -23,8 +22,7 @@ struct HomeView: View {
     @State private var showRenameAlert = false
     @State private var showDeleteAlert = false
     @State private var newDocumentName = ""
-    @State private var showPageReorder = false
-    @State private var pagesToReorder: [UIImage] = []
+    @State private var showIntegratedScanner = false
     
     let columns = [
         GridItem(.flexible(), spacing: 12),
@@ -77,33 +75,16 @@ struct HomeView: View {
                     }
                 }
             }
-            .sheet(isPresented: $showScanner) {
-                DocumentScannerView(
-                    didFinishScanning: { images in
-                        // Show reordering screen instead of processing immediately
-                        pagesToReorder = images
-                        showPageReorder = true
+            .sheet(isPresented: $showIntegratedScanner) {
+                IntegratedScannerView(
+                    onSave: { images in
+                        processScannedImages(images)
+                        showIntegratedScanner = false
                     },
-                    didCancel: {
-                        // Scanner was cancelled, nothing to do
+                    onCancel: {
+                        showIntegratedScanner = false
                     }
                 )
-            }
-            .sheet(isPresented: $showPageReorder) {
-                if !pagesToReorder.isEmpty {
-                    PageReorderView(
-                        pages: pagesToReorder,
-                        onSave: { reorderedPages in
-                            scannedImages = reorderedPages
-                            showPageReorder = false
-                        },
-                        onCancel: {
-                            scannedImages = nil
-                            pagesToReorder = []
-                            showPageReorder = false
-                        }
-                    )
-                }
             }
             .sheet(item: $selectedDocument) { document in
                 DocumentReviewView(document: document)
@@ -194,12 +175,12 @@ struct HomeView: View {
         
         switch status {
         case .authorized:
-            showScanner = true
+            showIntegratedScanner = true
         case .notDetermined:
             AVCaptureDevice.requestAccess(for: .video) { granted in
                 DispatchQueue.main.async {
                     if granted {
-                        showScanner = true
+                        showIntegratedScanner = true
                     } else {
                         showCameraPermissionAlert = true
                     }
@@ -216,54 +197,15 @@ struct HomeView: View {
             return
         }
         
-        let pdfDocument = PDFDocument()
-        
-        // Process all images and add to PDF
-        for image in images {
-            // Apply B&W filter immediately
-            let filteredImage = applyBlackAndWhiteFilter(to: image)
-            
-            // Ensure image is properly sized for PDF
-            guard let pdfPage = PDFPage(image: filteredImage) else {
-                print("Failed to create PDF page from image")
-                continue
-            }
-            
-            pdfDocument.insert(pdfPage, at: pdfDocument.pageCount)
-        }
-        
-        // Verify we have pages before saving
-        guard pdfDocument.pageCount > 0 else {
-            print("No pages to save")
-            return
-        }
-        
         do {
-            _ = try documentService.savePDF(pdfDocument, filterType: .blackAndWhite)
+            // Images are already processed (filtered/signed) in IntegratedScannerView
+            // Just save them as PDF with color filter (images are already processed)
+            _ = try documentService.saveImagesAsPDF(images, filterType: .color)
             // Clear scanned images after successful save
             scannedImages = nil
         } catch {
             print("Failed to save document: \(error.localizedDescription)")
         }
-    }
-    
-    private func applyBlackAndWhiteFilter(to image: UIImage) -> UIImage {
-        guard let cgImage = image.cgImage else { return image }
-        
-        let context = CIContext(options: nil)
-        let ciImage = CIImage(cgImage: cgImage)
-        
-        guard let filter = CIFilter(name: "CIColorControls") else { return image }
-        filter.setValue(ciImage, forKey: kCIInputImageKey)
-        filter.setValue(1.5, forKey: kCIInputContrastKey) // High contrast
-        filter.setValue(0.0, forKey: kCIInputSaturationKey) // Remove color
-        
-        guard let outputImage = filter.outputImage,
-              let cgImage = context.createCGImage(outputImage, from: outputImage.extent) else {
-            return image
-        }
-        
-        return UIImage(cgImage: cgImage)
     }
 }
 
