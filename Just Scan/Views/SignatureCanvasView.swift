@@ -1,8 +1,6 @@
 //
 //  SignatureCanvasView.swift
-//  Just Scan
-//
-//  Created by John Uja on 2025-12-16.
+//  Just Scan - ENHANCED VERSION
 //
 
 import SwiftUI
@@ -11,11 +9,18 @@ struct SignatureCanvasView: View {
     @Environment(\.dismiss) var dismiss
     @StateObject private var signatureService = SignatureService.shared
     
-    // Optional callback to tell the parent view we finished
     let onSave: (() -> Void)?
     
     @State private var currentDrawing = Drawing()
     @State private var drawings: [Drawing] = []
+    
+    // ✅ Undo/Redo support
+    @State private var undoStack: [[Drawing]] = []
+    @State private var redoStack: [[Drawing]] = []
+    
+    // ✅ Stroke customization
+    @State private var strokeWidth: CGFloat = 3.0
+    @State private var showStrokeOptions = false
     
     init(onSave: (() -> Void)? = nil) {
         self.onSave = onSave
@@ -24,31 +29,15 @@ struct SignatureCanvasView: View {
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
-                // 1. THE DRAWING CANVAS
+                // Canvas
                 Canvas { context, size in
-                    // Draw saved strokes
                     for drawing in drawings {
-                        var path = Path()
-                        if let first = drawing.points.first {
-                            path.move(to: first)
-                            for point in drawing.points.dropFirst() {
-                                path.addLine(to: point)
-                            }
-                        }
-                        context.stroke(path, with: .color(.white), lineWidth: 3)
+                        drawStroke(context: context, points: drawing.points, width: drawing.lineWidth)
                     }
-                    // Draw current active stroke
-                    if !currentDrawing.points.isEmpty {
-                        var path = Path()
-                        path.move(to: currentDrawing.points[0])
-                        for point in currentDrawing.points.dropFirst() {
-                            path.addLine(to: point)
-                        }
-                        context.stroke(path, with: .color(.white), lineWidth: 3)
-                    }
+                    drawStroke(context: context, points: currentDrawing.points, width: strokeWidth)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(Color.black) // Dark Mode Background
+                .background(Color.black)
                 .gesture(
                     DragGesture(minimumDistance: 0)
                         .onChanged { value in
@@ -56,31 +45,90 @@ struct SignatureCanvasView: View {
                         }
                         .onEnded { _ in
                             if !currentDrawing.points.isEmpty {
+                                registerUndo()
+                                currentDrawing.lineWidth = strokeWidth
                                 drawings.append(currentDrawing)
                                 currentDrawing = Drawing()
                             }
                         }
                 )
                 
-                // 2. TOOLBAR
-                HStack {
+                // Stroke Width Picker
+                if showStrokeOptions {
+                    VStack(spacing: 8) {
+                        Text("Stroke Width: \(Int(strokeWidth))")
+                            .foregroundColor(.white)
+                            .font(.caption)
+                        
+                        Slider(value: $strokeWidth, in: 1...10, step: 1)
+                            .tint(.blue)
+                            .padding(.horizontal)
+                    }
+                    .padding(.vertical, 8)
+                    .background(Color(white: 0.2))
+                    .transition(.move(edge: .bottom))
+                }
+                
+                // Toolbar
+                HStack(spacing: 16) {
+                    // Undo
+                    Button {
+                        undoAction()
+                    } label: {
+                        Image(systemName: "arrow.uturn.backward")
+                            .foregroundColor(undoStack.isEmpty ? .gray : .white)
+                    }
+                    .disabled(undoStack.isEmpty)
+                    
+                    // Redo
+                    Button {
+                        redoAction()
+                    } label: {
+                        Image(systemName: "arrow.uturn.forward")
+                            .foregroundColor(redoStack.isEmpty ? .gray : .white)
+                    }
+                    .disabled(redoStack.isEmpty)
+                    
+                    Divider()
+                        .frame(height: 20)
+                        .background(Color.white.opacity(0.3))
+                    
+                    // Stroke Width Toggle
+                    Button {
+                        withAnimation {
+                            showStrokeOptions.toggle()
+                        }
+                    } label: {
+                        Image(systemName: "slider.horizontal.3")
+                            .foregroundColor(.white)
+                    }
+                    
+                    Divider()
+                        .frame(height: 20)
+                        .background(Color.white.opacity(0.3))
+                    
+                    // Clear
                     Button("Clear") {
+                        registerUndo()
                         drawings.removeAll()
                         currentDrawing = Drawing()
                     }
                     .foregroundColor(.red)
+                    .disabled(drawings.isEmpty && currentDrawing.points.isEmpty)
                     
                     Spacer()
                     
+                    // Save
                     Button("Save Signature") {
-                        saveSmartSignature()
+                        saveSignature()
                     }
                     .fontWeight(.bold)
                     .foregroundColor(.white)
-                    .padding(.horizontal, 24)
-                    .padding(.vertical, 12)
-                    .background(Color.blue)
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 10)
+                    .background(drawings.isEmpty && currentDrawing.points.isEmpty ? Color.gray : Color.blue)
                     .cornerRadius(20)
+                    .disabled(drawings.isEmpty && currentDrawing.points.isEmpty)
                 }
                 .padding()
                 .background(Color(uiColor: .systemBackground))
@@ -95,16 +143,46 @@ struct SignatureCanvasView: View {
         }
     }
     
-    // MARK: - SMART CROP LOGIC
-    private func saveSmartSignature() {
-        // Collect all points to find the bounding box
+    // MARK: - Drawing
+    
+    private func drawStroke(context: GraphicsContext, points: [CGPoint], width: CGFloat) {
+        guard !points.isEmpty else { return }
+        var path = Path()
+        path.move(to: points[0])
+        for point in points.dropFirst() {
+            path.addLine(to: point)
+        }
+        context.stroke(path, with: .color(.white), style: StrokeStyle(lineWidth: width, lineCap: .round, lineJoin: .round))
+    }
+    
+    // MARK: - Undo/Redo
+    
+    private func registerUndo() {
+        undoStack.append(drawings)
+        redoStack.removeAll()
+    }
+    
+    private func undoAction() {
+        guard let previous = undoStack.popLast() else { return }
+        redoStack.append(drawings)
+        drawings = previous
+    }
+    
+    private func redoAction() {
+        guard let next = redoStack.popLast() else { return }
+        undoStack.append(drawings)
+        drawings = next
+    }
+    
+    // MARK: - Save
+    
+    private func saveSignature() {
         let allPoints = drawings.flatMap { $0.points } + currentDrawing.points
         guard !allPoints.isEmpty else {
             dismiss()
             return
         }
         
-        // 1. Calculate the bounding box of the actual signature
         let xs = allPoints.map { $0.x }
         let ys = allPoints.map { $0.y }
         let minX = xs.min() ?? 0
@@ -112,30 +190,26 @@ struct SignatureCanvasView: View {
         let maxX = xs.max() ?? 0
         let maxY = ys.max() ?? 0
         
-        let width = maxX - minX
-        let height = maxY - minY
+        let drawingWidth = maxX - minX
+        let drawingHeight = maxY - minY
         
-        // 2. Add some breathing room (padding)
         let padding: CGFloat = 20
-        let finalSize = CGSize(width: width + (padding * 2), height: height + (padding * 2))
+        let renderSize = CGSize(width: drawingWidth + (padding * 2), height: drawingHeight + (padding * 2))
         
-        let renderer = UIGraphicsImageRenderer(size: finalSize)
+        let renderer = UIGraphicsImageRenderer(size: renderSize)
         
         let image = renderer.image { context in
             let ctx = context.cgContext
             
-            // 3. SET INK TO BLACK (For Documents)
             ctx.setStrokeColor(UIColor.black.cgColor)
-            ctx.setLineWidth(3.0)
             ctx.setLineCap(.round)
             ctx.setLineJoin(.round)
             
-            // 4. Shift the coordinate system so the signature starts at (0,0) + padding
             ctx.translateBy(x: -minX + padding, y: -minY + padding)
             
-            // 5. Draw
             for drawing in drawings {
                 guard let first = drawing.points.first else { continue }
+                ctx.setLineWidth(drawing.lineWidth)
                 ctx.move(to: first)
                 for point in drawing.points.dropFirst() {
                     ctx.addLine(to: point)
@@ -144,11 +218,9 @@ struct SignatureCanvasView: View {
             }
         }
         
-        // Save to Service
         signatureService.saveSignature(image)
         dismiss()
         
-        // Tell parent we are done
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
             onSave?()
         }
@@ -157,4 +229,5 @@ struct SignatureCanvasView: View {
 
 struct Drawing {
     var points: [CGPoint] = []
+    var lineWidth: CGFloat = 3.0
 }

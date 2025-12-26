@@ -13,6 +13,7 @@ import UIKit
 struct HomeView: View {
     @StateObject private var documentService = DocumentService.shared
     @StateObject private var signatureService = SignatureService.shared
+    @State private var showScanner = false
     @State private var showSettings = false
     @State private var scannedImages: [UIImage]?
     @State private var selectedDocument: Document?
@@ -22,7 +23,8 @@ struct HomeView: View {
     @State private var showRenameAlert = false
     @State private var showDeleteAlert = false
     @State private var newDocumentName = ""
-    @State private var showIntegratedScanner = false
+    @State private var showPageReorder = false
+    @State private var pagesToReorder: [UIImage] = []
     
     let columns = [
         GridItem(.flexible(), spacing: 12),
@@ -75,16 +77,127 @@ struct HomeView: View {
                     }
                 }
             }
-            .sheet(isPresented: $showIntegratedScanner) {
-                IntegratedScannerView(
-                    onSave: { images in
-                        processScannedImages(images)
-                        showIntegratedScanner = false
+            .sheet(isPresented: $showScanner) {
+                ZStack {
+                    DocumentScannerView(
+                        didFinishScanning: { images in
+                            // Only show reorder screen if we have pages
+                            guard !images.isEmpty else {
+                                print("⚠️ No pages scanned")
+                                // If we have existing pages, go back to review
+                                if !pagesToReorder.isEmpty {
+                                    showScanner = false
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                                        showPageReorder = true
+                                    }
+                                }
+                                return
+                            }
+                            // If we already have pages (coming back from review), append new ones
+                            // Otherwise, start fresh
+                            if pagesToReorder.isEmpty {
+                                pagesToReorder = images
+                            } else {
+                                pagesToReorder.append(contentsOf: images)
+                            }
+                            // Close scanner sheet first
+                            showScanner = false
+                            // Wait for scanner to fully dismiss before showing reorder sheet
+                            // This prevents "only presenting a single sheet is supported" warning
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                                if !pagesToReorder.isEmpty {
+                                    showPageReorder = true
+                                }
+                            }
+                        },
+                        didCancel: {
+                            // Scanner was cancelled - if we have existing pages, go back to review
+                            if !pagesToReorder.isEmpty {
+                                showScanner = false
+                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                                    showPageReorder = true
+                                }
+                            }
+                        }
+                    )
+                    
+                    // Persistent banner showing existing pages (only when continuing session)
+                    if !pagesToReorder.isEmpty {
+                        VStack {
+                            HStack {
+                                Spacer()
+                                VStack(spacing: 4) {
+                                    HStack(spacing: 6) {
+                                        Image(systemName: "doc.on.doc.fill")
+                                            .font(.system(size: 14))
+                                            .foregroundColor(.white)
+                                        VStack(alignment: .leading, spacing: 1) {
+                                            Text("Continuing Session")
+                                                .font(.system(size: 9))
+                                                .fontWeight(.medium)
+                                                .foregroundColor(.white.opacity(0.9))
+                                            Text("\(pagesToReorder.count) page\(pagesToReorder.count == 1 ? "" : "s") already scanned")
+                                                .font(.system(size: 11))
+                                                .fontWeight(.bold)
+                                                .foregroundColor(.white)
+                                        }
+                                    }
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 8)
+                                    .background(
+                                        LinearGradient(
+                                            colors: [Color.blue, Color.blue.opacity(0.8)],
+                                            startPoint: .leading,
+                                            endPoint: .trailing
+                                        )
+                                    )
+                                    .cornerRadius(10)
+                                    .shadow(color: .black.opacity(0.3), radius: 6, x: 0, y: 3)
+                                    .scaleEffect(0.8)
+                                }
+                                Spacer()
+                            }
+                            .padding(.top, 50)
+                            Spacer()
+                        }
+                        .allowsHitTesting(false) // Don't block scanner interactions
+                    }
+                }
+                .interactiveDismissDisabled(true) // Prevent accidental swipe-to-dismiss
+            }
+            .sheet(isPresented: Binding(
+                get: { showPageReorder && !pagesToReorder.isEmpty },
+                set: { newValue in
+                    showPageReorder = newValue
+                    if !newValue {
+                        // Don't clear pages when dismissed - they might be going back to scanner
+                        // Only clear if explicitly cancelled
+                    }
+                }
+            )) {
+                PageReorderView(
+                    pages: $pagesToReorder, // Use binding so changes sync automatically
+                    onSave: { reorderedPages in
+                        scannedImages = reorderedPages
+                        pagesToReorder = []
+                        showPageReorder = false
+                    },
+                    onBack: {
+                        // Go back to scanner - pages are already preserved in pagesToReorder via binding
+                        showPageReorder = false
+                        // Show scanner again after a brief delay
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                            showScanner = true
+                        }
                     },
                     onCancel: {
-                        showIntegratedScanner = false
+                        // Full cancel - clear everything
+                        scannedImages = nil
+                        pagesToReorder = []
+                        showPageReorder = false
                     }
                 )
+                .interactiveDismissDisabled(true) // Prevent accidental swipe-to-dismiss
             }
             .sheet(item: $selectedDocument) { document in
                 DocumentReviewView(document: document)
@@ -133,6 +246,10 @@ struct HomeView: View {
             } message: {
                 Text("Are you sure you want to delete this document? This action cannot be undone.")
             }
+            // Refresh thumbnails when PDF files change
+            .onReceive(NotificationCenter.default.publisher(for: .init("RefreshDocumentThumbnails"))) { _ in
+                documentService.loadDocuments()
+            }
         }
     }
     
@@ -175,12 +292,12 @@ struct HomeView: View {
         
         switch status {
         case .authorized:
-            showIntegratedScanner = true
+            showScanner = true
         case .notDetermined:
             AVCaptureDevice.requestAccess(for: .video) { granted in
                 DispatchQueue.main.async {
                     if granted {
-                        showIntegratedScanner = true
+                        showScanner = true
                     } else {
                         showCameraPermissionAlert = true
                     }
@@ -197,15 +314,80 @@ struct HomeView: View {
             return
         }
         
+        let pdfDocument = PDFDocument()
+        
+        // Process all images and add to PDF
+        for image in images {
+            // Stage 1: downscale and lightly compress to save storage, then apply B&W
+            let compressed = compressImage(image, maxDimension: 2500, quality: 0.8)
+            let filteredImage = applyBlackAndWhiteFilter(to: compressed)
+            
+            // Ensure image is properly sized for PDF
+            guard let pdfPage = PDFPage(image: filteredImage) else {
+                print("Failed to create PDF page from image")
+                continue
+            }
+            
+            pdfDocument.insert(pdfPage, at: pdfDocument.pageCount)
+        }
+        
+        // Verify we have pages before saving
+        guard pdfDocument.pageCount > 0 else {
+            print("No pages to save")
+            return
+        }
+        
         do {
-            // Images are already processed (filtered/signed) in IntegratedScannerView
-            // Just save them as PDF with color filter (images are already processed)
-            _ = try documentService.saveImagesAsPDF(images, filterType: .color)
+            // Already filtered; avoid reprocessing by passing .color
+            _ = try documentService.savePDF(pdfDocument, filterType: .color)
             // Clear scanned images after successful save
             scannedImages = nil
         } catch {
             print("Failed to save document: \(error.localizedDescription)")
         }
+    }
+    
+    private func applyBlackAndWhiteFilter(to image: UIImage) -> UIImage {
+        guard let cgImage = image.cgImage else { return image }
+        
+        let context = CIContext(options: nil)
+        let ciImage = CIImage(cgImage: cgImage)
+        
+        guard let filter = CIFilter(name: "CIColorControls") else { return image }
+        filter.setValue(ciImage, forKey: kCIInputImageKey)
+        filter.setValue(1.5, forKey: kCIInputContrastKey) // High contrast
+        filter.setValue(0.0, forKey: kCIInputSaturationKey) // Remove color
+        
+        guard let outputImage = filter.outputImage,
+              let cgImage = context.createCGImage(outputImage, from: outputImage.extent) else {
+            return image
+        }
+        
+        return UIImage(cgImage: cgImage)
+    }
+    
+    private func compressImage(_ image: UIImage, maxDimension: CGFloat, quality: CGFloat) -> UIImage {
+        let size = image.size
+        let scale = min(1.0, maxDimension / max(size.width, size.height))
+        if scale >= 1.0 {
+            // Still convert to JPEG to strip excess metadata/compression
+            if let data = image.jpegData(compressionQuality: quality),
+               let img = UIImage(data: data) {
+                return img
+            }
+            return image
+        }
+        
+        let targetSize = CGSize(width: size.width * scale, height: size.height * scale)
+        let renderer = UIGraphicsImageRenderer(size: targetSize)
+        let scaled = renderer.image { ctx in
+            image.draw(in: CGRect(origin: .zero, size: targetSize))
+        }
+        if let data = scaled.jpegData(compressionQuality: quality),
+           let img = UIImage(data: data) {
+            return img
+        }
+        return scaled
     }
 }
 

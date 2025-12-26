@@ -15,7 +15,7 @@ struct Just_ScanApp: App {
     var body: some Scene {
         WindowGroup {
             if storeManager.hasPurchased {
-                ContentView()
+            ContentView()
                     .preferredColorScheme(.dark) // Force dark mode
             } else if !hasAcceptedTerms {
                 TermsAcceptanceView {
