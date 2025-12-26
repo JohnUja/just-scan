@@ -13,6 +13,7 @@ class ImageStampAnnotation: PDFAnnotation {
     var originalColor: SignatureColor
     var originalAspectRatio: CGFloat
     private var storedImageData: Data?
+    var isLocked: Bool = false
     var imageSnapshot: UIImage? {
         guard let data = storedImageData else { return nil }
         return UIImage(data: data)
@@ -97,7 +98,7 @@ class ImageStampAnnotation: PDFAnnotation {
         let centerY = bounds.midY
         
         context.translateBy(x: centerX, y: centerY)
-
+        
         // SwiftUI rotation is clockwise; Quartz is counter‑clockwise.
         // Use the negated angle and avoid extra Y flips to keep orientation consistent.
         if originalRotation != 0 {
