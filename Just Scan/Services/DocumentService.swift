@@ -176,8 +176,8 @@ class DocumentService: ObservableObject {
     // Renders each page to an image, downscales, JPEG-compresses, and reassembles into a PDF.
     // Use for export/share to make signatures non-editable and shrink file size.
     func flattenAndCompress(pdfDocument: PDFDocument,
-                            maxDimension: CGFloat = 2000,
-                            jpegQuality: CGFloat = 0.6) -> PDFDocument? {
+                            maxDimension: CGFloat = 4000,
+                            jpegQuality: CGFloat = 0.9) -> PDFDocument? {
         let outputData = NSMutableData()
         guard let consumer = CGDataConsumer(data: outputData as CFMutableData) else { return nil }
         guard let firstPage = pdfDocument.page(at: 0) else { return nil }
@@ -194,7 +194,7 @@ class DocumentService: ObservableObject {
             
             context.beginPDFPage([kCGPDFContextMediaBox as String: targetBox] as CFDictionary)
             
-            // Render page into downscaled image
+            // Render page into high-quality image
             let image = UIGraphicsImageRenderer(size: targetSize).image { ctx in
                 ctx.cgContext.saveGState()
                 ctx.cgContext.translateBy(x: 0, y: targetSize.height)

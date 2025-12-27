@@ -19,6 +19,26 @@ class ImageStampAnnotation: PDFAnnotation {
         return UIImage(data: data)
     }
     
+    func updateImage(_ image: UIImage) {
+        self.storedImageData = image.pngData()
+        updateContents()
+    }
+    
+    private func updateContents() {
+        guard let data = storedImageData else { return }
+        let b64 = data.base64EncodedString()
+        let metadata: [String: Any] = [
+            "rotation": originalRotation,
+            "color": originalColor.rawValue,
+            "aspectRatio": originalAspectRatio,
+            "imageDataB64": b64
+        ]
+        if let jsonData = try? JSONSerialization.data(withJSONObject: metadata, options: []),
+           let jsonString = String(data: jsonData, encoding: .utf8) {
+            self.contents = jsonString
+        }
+    }
+    
     init(bounds: CGRect, image: UIImage, rotation: CGFloat, color: SignatureColor, aspectRatio: CGFloat) {
         self.originalRotation = rotation
         self.originalColor = color
@@ -31,19 +51,7 @@ class ImageStampAnnotation: PDFAnnotation {
         
         // Store the image data
         self.storedImageData = image.pngData()
-        
-        // Store metadata in annotation's contents as JSON for backward compatibility
-        // (in case the annotation is read as a regular PDFAnnotation elsewhere)
-        let metadata: [String: Any] = [
-            "rotation": rotation,
-            "color": color.rawValue,
-            "aspectRatio": aspectRatio
-        ]
-        
-        if let jsonData = try? JSONSerialization.data(withJSONObject: metadata, options: []),
-           let jsonString = String(data: jsonData, encoding: .utf8) {
-            self.contents = jsonString
-        }
+        updateContents()
     }
     
     required init?(coder: NSCoder) {

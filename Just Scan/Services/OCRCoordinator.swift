@@ -38,7 +38,7 @@ class OCRCoordinator: ObservableObject {
         request.recognitionLevel = .accurate
         request.usesLanguageCorrection = true
         
-        try requestHandler.perform([request])
+            try requestHandler.perform([request])
         
         guard let observations = request.results else {
             throw NSError(domain: "OCR", code: 0, userInfo: [NSLocalizedDescriptionKey: "No text found"])

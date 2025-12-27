@@ -37,6 +37,8 @@ struct DocumentReviewView: View {
     @State private var pendingSavePlacements: [SignaturePlacement]? = nil
     @State private var pendingSavePageIndex: Int? = nil
     @State private var pdfRefreshID = UUID()
+    @State private var activeAnnotation: ImageStampAnnotation? = nil
+    @State private var activeAnnotationPageIndex: Int? = nil
     
     // Undo/redo stacks per page (snapshots of placements)
     @State private var undoStack: [Int: [[SignaturePlacement]]] = [:]
@@ -71,23 +73,61 @@ struct DocumentReviewView: View {
         guard let pdfDocument = pdfDocument else { return }
         
         // Commit pending edits on all pages before sharing (write and clear overlays)
-        for (pageIndex, placements) in signaturePlacements {
-            if !placements.isEmpty || (hasPendingChanges && pageIndex == currentPageIndex) {
-                saveSignatureToPage(pageIndex: pageIndex)
-            }
+        for pageIndex in 0..<(pdfDocument.pageCount) {
+            saveSignatureToPage(pageIndex: pageIndex)
         }
         
-        // Share the current PDF without flattening/downsampling
+        guard let data = pdfDocument.dataRepresentation() else {
+            return
+        }
         let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("secured-\(UUID().uuidString).pdf")
-        guard pdfDocument.write(to: tempURL) else { return }
+        do {
+            try data.write(to: tempURL, options: .atomic)
+        } catch {
+            return
+        }
         
         DispatchQueue.main.async {
-            guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-                  let root = scene.windows.first?.rootViewController,
-                  root.presentedViewController == nil else { return }
+            guard let top = topMostViewController() else { return }
             let activity = UIActivityViewController(activityItems: [tempURL], applicationActivities: nil)
-            root.present(activity, animated: true)
+            DispatchQueue.main.async {
+                top.present(activity, animated: true)
+            }
         }
+    }
+    
+    // Flattened export-only share (baked)
+    private func secureAndShareFlattened() {
+        guard let pdfDocument = pdfDocument else { return }
+        
+        // Commit pending edits on all pages before exporting
+        for pageIndex in 0..<(pdfDocument.pageCount) {
+            saveSignatureToPage(pageIndex: pageIndex)
+        }
+        
+        guard let flattened = DocumentService.shared.flattenAndCompress(pdfDocument: pdfDocument) else { return }
+        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("secured-flattened-\(UUID().uuidString).pdf")
+        guard flattened.write(to: tempURL) else { return }
+        
+        DispatchQueue.main.async {
+            guard let top = topMostViewController() else { return }
+            let activity = UIActivityViewController(activityItems: [tempURL], applicationActivities: nil)
+            DispatchQueue.main.async {
+                top.present(activity, animated: true)
+            }
+        }
+    }
+    
+    private func topMostViewController() -> UIViewController? {
+        let scenes = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .filter { $0.activationState == .foregroundActive }
+        guard let window = scenes.first?.windows.first(where: { $0.isKeyWindow }),
+              var top = window.rootViewController else { return nil }
+        while let presented = top.presentedViewController { top = presented }
+        if let nav = top as? UINavigationController { top = nav.visibleViewController ?? nav }
+        if let tab = top as? UITabBarController { top = tab.selectedViewController ?? tab }
+        return top
     }
 
     struct PDFPageTransform {
@@ -189,7 +229,6 @@ struct DocumentReviewView: View {
                 }
                 .onAppear {
                     loadPDF()
-                    detectExistingSignatures()
                 }
                 .onChange(of: ocrCoordinator.resultText) { newValue in
                     if let text = newValue {
@@ -209,6 +248,19 @@ struct DocumentReviewView: View {
                     if placing {
                         appendNewPlacementIfNeeded()
                     }
+                }
+                .onDisappear {
+        if let pdfDocument = pdfDocument {
+            for pageIndex in 0..<pdfDocument.pageCount {
+                saveSignatureToPage(pageIndex: pageIndex)
+            }
+        }
+                    signaturePlacements = [:]
+                    activePlacementID = [:]
+                    activeAnnotation = nil
+                    activeAnnotationPageIndex = nil
+                    isPlacingSignature = false
+                    hasPendingChanges = false
                 }
                 .alert("Multiple Signatures Detected", isPresented: $showSignatureWarning) {
                     Button("Cancel", role: .cancel) {
@@ -261,20 +313,20 @@ struct DocumentReviewView: View {
                                 .shadow(color: .black.opacity(0.15), radius: 10, y: 5)
                                 .allowsHitTesting(!isPlacingSignature)
                             
-                            // Tap layer for saved PDF annotations when not editing
-                            if !isPlacingSignature {
-                                SavedSignatureOverlay(
+                            // Tap layer for saved PDF annotations (always available)
+                            SavedSignatureOverlay(
                                         pdfDocument: pdfDocument,
-                                    pageIndex: currentPageIndex,
-                                    selectedSignature: .constant(nil),
-                                    currentlyEditingAnnotation: nil,
-                                    onDelete: { _ in },
-                                    onEdit: { annotation in
-                                        beginEditing(annotation: annotation, pageIndex: currentPageIndex)
-                                    }
-                                )
+                                pageIndex: currentPageIndex,
+                                selectedSignature: .constant(nil),
+                                currentlyEditingAnnotation: activeAnnotation,
+                                onDelete: { _ in },
+                                onEdit: { annotation in
+                                    // commit current edits in memory before switching
+                                    commitActiveEditInMemory()
+                                    beginEditing(annotation: annotation, pageIndex: currentPageIndex)
+                                }
+                            )
                                         .allowsHitTesting(true)
-                            }
                             
                             // Unified signature overlay (active + background)
                             signatureOverlay(pdfDocument: pdfDocument)
@@ -306,7 +358,8 @@ struct DocumentReviewView: View {
         ZStack {
             ForEach(placements, id: \.id) { placement in
                 let isActive = placement.id == activeID
-                let z = Double(placements.firstIndex(where: { $0.id == placement.id }) ?? 0)
+                let index = placements.firstIndex(where: { $0.id == placement.id }) ?? 0
+                let z = Double((placements.count - 1) - index) // older on top
                 
                 if isActive {
                     InlineSignatureOverlay(
@@ -326,7 +379,8 @@ struct DocumentReviewView: View {
                         pageIndex: currentPageIndex,
                         pdfDocument: pdfDocument,
                         signatureImage: placement.signatureImage,
-                        placement: placement
+                        placement: placement,
+                        showImage: false // hide overlay image for saved/editing signatures
                     )
                     .zIndex(z)
                     .onTapGesture {
@@ -413,7 +467,12 @@ struct DocumentReviewView: View {
                             Button {
                                 secureAndShare()
                             } label: {
-                                Label("Share Secured PDF", systemImage: "square.and.arrow.up")
+                                Label("Share Secured PDF (locked)", systemImage: "square.and.arrow.up")
+                            }
+                            Button {
+                                secureAndShareFlattened()
+                            } label: {
+                                Label("Share Flattened PDF", systemImage: "square.and.arrow.up.on.square.fill")
                             }
                         }
                         
@@ -461,57 +520,6 @@ struct DocumentReviewView: View {
     
     // MARK: - Logic Helpers
     
-    private func detectExistingSignatures() {
-        guard let pdfDocument = pdfDocument else { return }
-        var ingested: [Int: [SignaturePlacement]] = [:]
-        
-        for pageIndex in 0..<pdfDocument.pageCount {
-            guard let page = pdfDocument.page(at: pageIndex) else { continue }
-        let pageRect = page.bounds(for: .mediaBox)
-            
-            let placements = page.annotations.compactMap { annotation -> SignaturePlacement? in
-                guard annotation.userName == "Signature" else { return nil }
-                let bounds = annotation.bounds
-                
-                let rotation: CGFloat
-                let color: SignatureColor
-                let aspectRatio: CGFloat
-                let image: UIImage
-                
-                if let stamp = annotation as? ImageStampAnnotation {
-                    rotation = stamp.originalRotation
-                    color = stamp.originalColor
-                    aspectRatio = bounds.width > 0 ? bounds.width / bounds.height : 2.0
-                    image = stamp.imageSnapshot ?? signatureService.signatureImage ?? UIImage()
-        } else {
-                    rotation = 0
-                    color = .black
-            aspectRatio = bounds.width > 0 ? bounds.width / bounds.height : 2.0
-                    image = signatureService.signatureImage ?? UIImage()
-                }
-                
-                let center = CGPoint(
-                    x: bounds.midX / pageRect.width,
-                    y: bounds.midY / pageRect.height
-                )
-                
-                return SignaturePlacement(
-                    center: center,
-                    widthRatio: bounds.width / pageRect.width,
-            rotation: rotation,
-            color: color,
-                    aspectRatio: aspectRatio,
-                    signatureImage: image
-                )
-            }
-            
-            if !placements.isEmpty {
-                ingested[pageIndex] = placements
-            }
-        }
-        
-        signaturePlacements = ingested
-    }
     
     private func signatureBinding(pageIndex: Int, placementID: UUID) -> Binding<SignaturePlacement> {
         Binding(
@@ -533,6 +541,15 @@ struct DocumentReviewView: View {
                     list[idx] = newValue
                     signaturePlacements[pageIndex] = list
                     redoStack[pageIndex] = []
+                    
+                    // If editing an existing annotation in place, update it
+                    if let pdfDocument = pdfDocument,
+                       let page = pdfDocument.page(at: pageIndex),
+                       let stamp = activeAnnotation,
+                       activeAnnotationPageIndex == pageIndex,
+                       placementID == activePlacementID[pageIndex] {
+                        applyPlacement(newValue, to: stamp, on: page)
+                    }
                 }
             }
         )
@@ -586,22 +603,31 @@ struct DocumentReviewView: View {
         let pageRect = page.bounds(for: .mediaBox)
         let bounds = annotation.bounds
         
-        let rotation: CGFloat
-        let color: SignatureColor
-        let aspectRatio: CGFloat
-        let image: UIImage
+        var rotation: CGFloat = 0
+        var color: SignatureColor = .black
+        var aspectRatio: CGFloat = bounds.width > 0 ? bounds.width / bounds.height : 2.0
+        var image: UIImage?
         
         if let stamp = annotation as? ImageStampAnnotation {
             rotation = stamp.originalRotation
             color = stamp.originalColor
-            aspectRatio = bounds.width > 0 ? bounds.width / bounds.height : 2.0
-            image = stamp.imageSnapshot ?? signatureService.signatureImage ?? UIImage()
-        } else {
-            rotation = 0
-            color = .black
-            aspectRatio = bounds.width > 0 ? bounds.width / bounds.height : 2.0
-            image = signatureService.signatureImage ?? UIImage()
+            aspectRatio = stamp.originalAspectRatio
+            image = stamp.imageSnapshot
         }
+        
+        // Fallback: parse contents JSON for base64 image
+        if image == nil, let contents = annotation.contents,
+           let data = contents.data(using: .utf8),
+           let json = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] {
+            if let rot = json["rotation"] as? Double { rotation = CGFloat(rot) }
+            if let colorRaw = json["color"] as? String, let c = SignatureColor(rawValue: colorRaw) { color = c }
+            if let ar = json["aspectRatio"] as? Double { aspectRatio = CGFloat(ar) }
+            if let b64 = json["imageDataB64"] as? String, let imgData = Data(base64Encoded: b64) {
+                image = UIImage(data: imgData)
+            }
+        }
+        
+        guard let finalImage = image else { return nil }
         
         let center = CGPoint(
             x: bounds.midX / pageRect.width,
@@ -614,22 +640,26 @@ struct DocumentReviewView: View {
             rotation: rotation,
             color: color,
             aspectRatio: aspectRatio,
-            signatureImage: image
+            signatureImage: finalImage
         )
     }
     
     private func beginEditing(annotation: PDFAnnotation, pageIndex: Int) {
-        guard let pdfDocument = pdfDocument, let page = pdfDocument.page(at: pageIndex) else { return }
-        guard let placement = placement(from: annotation, on: page) else { return }
+        // commit current editing overlay into the active annotation in memory (no disk)
+        commitActiveEditInMemory()
         
-        page.removeAnnotation(annotation)
-        var list = signaturePlacements[pageIndex] ?? []
-        list.append(placement)
-        signaturePlacements[pageIndex] = list
-        activePlacementID[pageIndex] = placement.id
+        guard let pdfDocument = pdfDocument,
+              let _ = pdfDocument.page(at: pageIndex),
+              let stamp = annotation as? ImageStampAnnotation else { return }
+        
+        activeAnnotation = stamp
+        activeAnnotationPageIndex = pageIndex
         isPlacingSignature = true
-        hasPendingChanges = true
+        hasPendingChanges = false
         redoStack[pageIndex] = []
+        
+        signaturePlacements[pageIndex] = []
+        activePlacementID[pageIndex] = nil
     }
     
     
@@ -694,29 +724,24 @@ struct DocumentReviewView: View {
     
     private func saveSignatureToPage(pageIndex: Int) {
         guard let pdfDocument = pdfDocument, let page = pdfDocument.page(at: pageIndex) else { return }
-        let placements = signaturePlacements[pageIndex] ?? []
         
-        // Detect mixed signature images and warn before committing
-        if shouldWarnAboutDifferentSignatures(placements: placements, page: page, pageIndex: pageIndex) {
+        // Detect mixed signature images across existing + unsaved
+        var allPlacements: [SignaturePlacement] = []
+        for annotation in page.annotations where annotation.userName == "Signature" {
+            if let active = activeAnnotation, annotation === active { continue }
+            if let p = placement(from: annotation, on: page) {
+                allPlacements.append(p)
+            }
+        }
+        let unsaved = signaturePlacements[pageIndex] ?? []
+        allPlacements.append(contentsOf: unsaved)
+        
+        if shouldWarnAboutDifferentSignatures(placements: allPlacements, page: page, pageIndex: pageIndex) {
             return
         }
         
-        // If nothing changed and nothing to save, avoid wiping existing annotations
-        if !hasPendingChanges && placements.isEmpty {
-            return
-        }
-        
-        performSave(placements: placements, pageIndex: pageIndex, page: page)
-    }
-    
-    private func performSave(placements: [SignaturePlacement], pageIndex: Int, page: PDFPage) {
-        guard let pdfDocument = pdfDocument else { return }
-        
-        // Hard wipe existing signature annotations
-        page.annotations.filter { $0.userName == "Signature" }.forEach { page.removeAnnotation($0) }
-        
-        // Re-write current placements (if any)
-        for placement in placements {
+        // Add only the new overlays; existing annotations remain in place
+        for placement in unsaved {
             if let annotation = makeAnnotation(from: placement, on: page) {
                 page.addAnnotation(annotation)
             }
@@ -727,12 +752,19 @@ struct DocumentReviewView: View {
             NotificationCenter.default.post(name: .init("RefreshDocumentThumbnails"), object: nil)
         }
         
-        // Clear overlay state after baking into PDF to avoid doubling/ghosting
         signaturePlacements[pageIndex] = []
         activePlacementID[pageIndex] = nil
+        activeAnnotation = nil
+        activeAnnotationPageIndex = nil
         isPlacingSignature = false
         hasPendingChanges = false
         pdfRefreshID = UUID()
+    }
+    
+    private func performSave(placements: [SignaturePlacement], pageIndex: Int, page: PDFPage) {
+        guard let pdfDocument = pdfDocument else { return }
+        
+        // Deprecated: no longer used for incremental saves
     }
     
     // Bulk save removed for simplicity; saving happens per page as needed
@@ -779,6 +811,49 @@ struct DocumentReviewView: View {
         annotation.isLocked = true
         annotation.shouldPrint = true
         return annotation
+    }
+    
+    private func applyPlacement(_ placement: SignaturePlacement, to annotation: ImageStampAnnotation, on page: PDFPage) {
+        let pageRect = page.bounds(for: .mediaBox)
+        let pdfWidth = pageRect.width * placement.widthRatio
+        let pdfHeight = pdfWidth / placement.aspectRatio
+        let pdfCenterX = placement.center.x * pageRect.width
+        let pdfX = pdfCenterX - (pdfWidth / 2)
+        let pdfCenterY = placement.center.y * pageRect.height
+        let pdfY = pdfCenterY - (pdfHeight / 2)
+        let clampedX = max(0, min(pdfX, pageRect.width - pdfWidth))
+        let clampedY = max(0, min(pdfY, pageRect.height - pdfHeight))
+        let signatureBounds = CGRect(x: clampedX, y: clampedY, width: pdfWidth, height: pdfHeight)
+        
+        let finalImage = placement.color == .black ? placement.signatureImage : applyColorToSignature(placement.signatureImage, color: placement.color)
+        
+        annotation.bounds = signatureBounds
+        annotation.originalRotation = placement.rotation
+        annotation.originalColor = placement.color
+        annotation.originalAspectRatio = placement.aspectRatio
+        annotation.updateImage(finalImage)
+    }
+    
+    private func commitActiveEditInMemory() {
+        guard
+            let pageIndex = activeAnnotationPageIndex,
+            let placementID = activePlacementID[pageIndex] ?? signaturePlacements[pageIndex]?.first?.id,
+            let placement = signaturePlacements[pageIndex]?.first(where: { $0.id == placementID }),
+            let pdfDocument = pdfDocument,
+            let page = pdfDocument.page(at: pageIndex),
+            let stamp = activeAnnotation
+        else {
+            activeAnnotation = nil
+            activeAnnotationPageIndex = nil
+            return
+        }
+        
+        applyPlacement(placement, to: stamp, on: page)
+        signaturePlacements[pageIndex] = []
+        activePlacementID[pageIndex] = nil
+        activeAnnotation = nil
+        activeAnnotationPageIndex = nil
+        hasPendingChanges = true
     }
     
     private func appendNewPlacementIfNeeded() {
@@ -1210,46 +1285,6 @@ struct FloatingToolbarViewInline: View {
     }
 }
 
-// MARK: - Unsaved Signature Overlay
-struct UnsavedSignatureOverlay: View {
-    let pageIndex: Int
-    let pdfDocument: PDFDocument
-    let signatureImage: UIImage
-    let placement: DocumentReviewView.SignaturePlacement
-    
-    var body: some View {
-        GeometryReader { geometry in
-            if let page = pdfDocument.page(at: pageIndex) {
-                let transform = DocumentReviewView.PDFPageTransform(page: page, viewSize: geometry.size)
-                let center = transform.viewPoint(from: placement.center)
-                let size = transform.viewSize(widthRatio: placement.widthRatio, aspectRatio: placement.aspectRatio)
-                
-                Image(uiImage: tinted(signatureImage, color: placement.color))
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(width: size.width, height: size.height)
-                    .rotationEffect(.degrees(placement.rotation))
-                    .contentShape(Rectangle())
-                    .position(center)
-            }
-        }
-    }
-    
-    private func tinted(_ image: UIImage, color: SignatureColor) -> UIImage {
-        guard color != .black, let cgImage = image.cgImage else { return image }
-        let ciImage = CIImage(cgImage: cgImage)
-        guard let filter = CIFilter(name: "CIColorMonochrome") else { return image }
-        filter.setValue(ciImage, forKey: kCIInputImageKey)
-        filter.setValue(CIColor(color: color.uiColor), forKey: kCIInputColorKey)
-        filter.setValue(1.0, forKey: kCIInputIntensityKey)
-        guard let outputImage = filter.outputImage,
-              let cgImageOutput = DocumentReviewView.ciContext.createCGImage(outputImage, from: outputImage.extent) else {
-            return image
-        }
-        return UIImage(cgImage: cgImageOutput)
-    }
-}
-
 // MARK: - Saved Signature Overlay
 struct SavedSignatureOverlay: View {
     let pdfDocument: PDFDocument
@@ -1266,8 +1301,9 @@ struct SavedSignatureOverlay: View {
                 let signatureAnnotations = page.annotations.filter {
                     $0.userName == "Signature" && $0 !== currentlyEditingAnnotation
                 }
+                let annotatedItems = signatureAnnotations.map { (ObjectIdentifier($0), $0) }
                 
-                ForEach(Array(signatureAnnotations.enumerated()), id: \.offset) { _, annotation in
+                ForEach(annotatedItems, id: \.0) { _, annotation in
                         let bounds = annotation.bounds
                     let normalizedCenter = CGPoint(
                         x: bounds.midX / transform.pageRect.width,
