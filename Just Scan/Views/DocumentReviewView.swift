@@ -1789,6 +1789,8 @@ struct SavedSignatureSelectionOverlay: View {
                             onMoveStart: { onGestureStart() },
                             onMoveChanged: { newPos in
                                 tempPosition = newPos
+                                // Update placement live so the underlying annotation moves in sync
+                                placement.center = newPos
                             },
                             onMoveEnded: {
                                 if let finalPos = tempPosition {
