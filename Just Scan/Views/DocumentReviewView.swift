@@ -40,6 +40,11 @@ struct DocumentReviewView: View {
     @State private var activeAnnotation: PDFAnnotation? = nil
     @State private var activeAnnotationPageIndex: Int? = nil
     @State private var editingPlacement: SignaturePlacement? = nil // Separate state for saved annotation editing
+    @State private var savedAnnotationUndoStack: [Int: [SignaturePlacement]] = [:]
+    @State private var savedAnnotationRedoStack: [Int: [SignaturePlacement]] = [:]
+    @State private var showExitPrompt: Bool = false
+    @State private var showDocumentSignatureWarning: Bool = false
+    @State private var pendingShareAction: (() -> Void)? = nil
     
     // Undo/redo stacks per page (snapshots of placements)
     @State private var undoStack: [Int: [[SignaturePlacement]]] = [:]
@@ -80,23 +85,33 @@ struct DocumentReviewView: View {
             saveSignatureToPage(pageIndex: currentPageIndex, persistToDisk: false)
         }
         
-        guard let data = pdfDocument.dataRepresentation() else {
-            return
+        let proceedShare: () -> Void = { [document] in
+            guard let data = pdfDocument.dataRepresentation() else {
+                return
+            }
+            let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("secured-\(UUID().uuidString).pdf")
+            do {
+                try data.write(to: tempURL, options: .atomic)
+            } catch {
+                return
+            }
+            
+            DispatchQueue.main.async {
+                guard let top = topMostViewController() else { return }
+                let activity = UIActivityViewController(activityItems: [tempURL], applicationActivities: nil)
+                DispatchQueue.main.async {
+                    top.present(activity, animated: true)
+                }
+            }
         }
-        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("secured-\(UUID().uuidString).pdf")
-        do {
-            try data.write(to: tempURL, options: .atomic)
-        } catch {
+
+        if hasMixedSignaturesInDocument(pdfDocument) {
+            pendingShareAction = proceedShare
+            showDocumentSignatureWarning = true
             return
         }
         
-        DispatchQueue.main.async {
-            guard let top = topMostViewController() else { return }
-            let activity = UIActivityViewController(activityItems: [tempURL], applicationActivities: nil)
-            DispatchQueue.main.async {
-                top.present(activity, animated: true)
-            }
-        }
+        proceedShare()
     }
     
     // Flattened export-only share (baked)
@@ -110,17 +125,27 @@ struct DocumentReviewView: View {
         }
         
         // Flatten the current PDF (no wipe/rebuild)
-        guard let flattened = DocumentService.shared.flattenAndCompress(pdfDocument: pdfDocument) else { return }
-        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("secured-flattened-\(UUID().uuidString).pdf")
-        guard flattened.write(to: tempURL) else { return }
-        
-        DispatchQueue.main.async {
-            guard let top = topMostViewController() else { return }
-            let activity = UIActivityViewController(activityItems: [tempURL], applicationActivities: nil)
+        let proceedFlattenShare: () -> Void = {
+            guard let flattened = DocumentService.shared.flattenAndCompress(pdfDocument: pdfDocument) else { return }
+            let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("secured-flattened-\(UUID().uuidString).pdf")
+            guard flattened.write(to: tempURL) else { return }
+            
             DispatchQueue.main.async {
-                top.present(activity, animated: true)
+                guard let top = topMostViewController() else { return }
+                let activity = UIActivityViewController(activityItems: [tempURL], applicationActivities: nil)
+                DispatchQueue.main.async {
+                    top.present(activity, animated: true)
+                }
             }
         }
+
+        if hasMixedSignaturesInDocument(pdfDocument) {
+            pendingShareAction = proceedFlattenShare
+            showDocumentSignatureWarning = true
+            return
+        }
+
+        proceedFlattenShare()
     }
     
     private func topMostViewController() -> UIViewController? {
@@ -265,6 +290,36 @@ struct DocumentReviewView: View {
                 } message: {
                     Text("This document contains different signature images. Are you sure you want to proceed?")
                 }
+                .confirmationDialog("Unsaved Changes", isPresented: $showExitPrompt) {
+                    Button("Save") {
+                        saveSignatureToPage(pageIndex: currentPageIndex, persistToDisk: true)
+                        activeAnnotation = nil
+                        activeAnnotationPageIndex = nil
+                        editingPlacement = nil
+                        dismiss()
+                    }
+                    Button("Discard", role: .destructive) {
+                        discardChangesAndReload()
+                        dismiss()
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text("You have unsaved signature changes. Save or discard before exiting.")
+                }
+                .confirmationDialog("Different signatures detected", isPresented: $showDocumentSignatureWarning) {
+                    Button("Share Anyway") {
+                        let action = pendingShareAction
+                        pendingShareAction = nil
+                        showDocumentSignatureWarning = false
+                        action?()
+                    }
+                    Button("Cancel", role: .cancel) {
+                        pendingShareAction = nil
+                        showDocumentSignatureWarning = false
+                    }
+                } message: {
+                    Text("This document contains different signature images across pages. Do you want to continue sharing?")
+                }
         }
     }
     
@@ -375,16 +430,21 @@ struct DocumentReviewView: View {
                     ),
                     onDelete: {
                         // Delete the annotation directly
-                        if let page = pdfDocument.page(at: currentPageIndex),
-                           let annotation = activeAnnotation {
-                            page.removeAnnotation(annotation)
-                        }
-                        self.activeAnnotation = nil
-                        self.activeAnnotationPageIndex = nil
-                        self.editingPlacement = nil
-                        isPlacingSignature = false
-                        hasPendingChanges = true
-                        pdfRefreshID = UUID()
+            if let page = pdfDocument.page(at: currentPageIndex),
+               let annotation = activeAnnotation {
+                page.removeAnnotation(annotation)
+            }
+            self.activeAnnotation = nil
+            self.activeAnnotationPageIndex = nil
+            self.editingPlacement = nil
+            isPlacingSignature = false
+            hasPendingChanges = true
+            savedAnnotationUndoStack[currentPageIndex] = []
+            savedAnnotationRedoStack[currentPageIndex] = []
+            pdfRefreshID = UUID()
+                    },
+                    onGestureStart: {
+                        registerSavedAnnotationUndoSnapshot(for: currentPageIndex)
                     }
                 )
             } else {
@@ -456,75 +516,78 @@ struct DocumentReviewView: View {
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
         if hasPendingChanges {
-                    ToolbarItemGroup(placement: .navigationBarLeading) {
-                        Button(action: { undoAction(for: currentPageIndex) }) {
-                            Image(systemName: "arrow.uturn.backward.circle")
-                        }
-                        .disabled((undoStack[currentPageIndex]?.isEmpty ?? true))
-                        
-                        Button(action: { redoAction(for: currentPageIndex) }) {
-                            Image(systemName: "arrow.uturn.forward.circle")
-                        }
-                        .disabled((redoStack[currentPageIndex]?.isEmpty ?? true))
-                    }
-                    
-                    ToolbarItemGroup(placement: .navigationBarTrailing) {
-                            Button(action: { appendNewPlacement() }) {
-                            Image(systemName: "plus.circle")
-                        }
-                            Button("Save") {
-                                saveSignatureToPage(pageIndex: currentPageIndex, persistToDisk: true)
-                            }
-                        .fontWeight(.semibold)
-                    }
-                } else {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button("Done") {
-                        // Clear any editing state before dismissing
-                        commitActiveEditInMemory()
-                        activeAnnotation = nil
-                        activeAnnotationPageIndex = nil
-                        editingPlacement = nil
-                        dismiss()
-                    }
+            ToolbarItemGroup(placement: .navigationBarLeading) {
+                Button(action: { undoAction(for: currentPageIndex) }) {
+                    Image(systemName: "arrow.uturn.backward.circle")
                 }
+                .disabled((undoStack[currentPageIndex]?.isEmpty ?? true) && (savedAnnotationUndoStack[currentPageIndex]?.isEmpty ?? true))
                 
-                if let pdfDoc = pdfDocument, pdfDoc.pageCount > 1 {
-                    ToolbarItem(placement: .principal) {
-                        Text("\(currentPageIndex + 1) / \(pdfDoc.pageCount)")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
+                Button(action: { redoAction(for: currentPageIndex) }) {
+                    Image(systemName: "arrow.uturn.forward.circle")
                 }
+                .disabled((redoStack[currentPageIndex]?.isEmpty ?? true) && (savedAnnotationRedoStack[currentPageIndex]?.isEmpty ?? true))
+            }
+            
+            ToolbarItemGroup(placement: .navigationBarTrailing) {
+                Button(action: { appendNewPlacement() }) {
+                    Image(systemName: "plus.circle")
+                }
+                Button("Save") {
+                    saveSignatureToPage(pageIndex: currentPageIndex, persistToDisk: true)
+                }
+                .fontWeight(.semibold)
                 
-                ToolbarItemGroup(placement: .navigationBarTrailing) {
-                    Button { performOCR() } label: { Image(systemName: "text.viewfinder") }
-                        .disabled(ocrCoordinator.isProcessing)
-                    
-                    Button { showSignatureOptions = true } label: { Image(systemName: "signature") }
-                    
-                    Menu {
-                        Section("Export Options") {
-                            Button {
-                                secureAndShare()
-                            } label: {
-                                Label("Share Secured PDF (locked)", systemImage: "square.and.arrow.up")
-                            }
-                            Button {
-                                secureAndShareFlattened()
-                            } label: {
-                                Label("Share Flattened PDF", systemImage: "square.and.arrow.up.on.square.fill")
-                            }
+                Button("Done") {
+                    showExitPrompt = true
+                }
+            }
+        } else {
+            ToolbarItem(placement: .navigationBarLeading) {
+                Button("Done") {
+                    commitActiveEditInMemory()
+                    activeAnnotation = nil
+                    activeAnnotationPageIndex = nil
+                    editingPlacement = nil
+                    dismiss()
+                }
+            }
+            
+            if let pdfDoc = pdfDocument, pdfDoc.pageCount > 1 {
+                ToolbarItem(placement: .principal) {
+                    Text("\(currentPageIndex + 1) / \(pdfDoc.pageCount)")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+            
+            ToolbarItemGroup(placement: .navigationBarTrailing) {
+                Button { performOCR() } label: { Image(systemName: "text.viewfinder") }
+                    .disabled(ocrCoordinator.isProcessing)
+                
+                Button { showSignatureOptions = true } label: { Image(systemName: "signature") }
+                
+                Menu {
+                    Section("Export Options") {
+                        Button {
+                            secureAndShare()
+                        } label: {
+                            Label("Share Secured PDF (locked)", systemImage: "square.and.arrow.up")
                         }
-                        
-                        Section("Document Tools") {
-                            Button("Filters", systemImage: "slider.horizontal.3") {
-                                showFilterOptions = true
-                            }
+                        Button {
+                            secureAndShareFlattened()
+                        } label: {
+                            Label("Share Flattened PDF", systemImage: "square.and.arrow.up.on.square.fill")
                         }
-                    } label: {
-                        Image(systemName: "ellipsis.circle")
                     }
+                    
+                    Section("Document Tools") {
+                        Button("Filters", systemImage: "slider.horizontal.3") {
+                            showFilterOptions = true
+                        }
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                }
             }
         }
     }
@@ -604,8 +667,7 @@ struct DocumentReviewView: View {
         var signatureHashes: Set<String> = []
         
         for annotation in page.annotations where annotation.userName == "Signature" {
-            if let stamp = annotation as? ImageStampAnnotation,
-               let data = stamp.imageSnapshot?.pngData() {
+            if let data = signatureData(for: annotation) {
                 signatureHashes.insert(data.hashValue.description)
             }
         }
@@ -623,6 +685,34 @@ struct DocumentReviewView: View {
             return true
         }
         return false
+    }
+    
+    private func hasMixedSignaturesInDocument(_ pdfDocument: PDFDocument) -> Bool {
+        var signatureHashes: Set<String> = []
+        for pageIndex in 0..<pdfDocument.pageCount {
+            guard let page = pdfDocument.page(at: pageIndex) else { continue }
+            for annotation in page.annotations where annotation.userName == "Signature" {
+                if let data = signatureData(for: annotation) {
+                    signatureHashes.insert(data.hashValue.description)
+                    if signatureHashes.count > 1 { return true }
+                }
+            }
+        }
+        return false
+    }
+    
+    private func signatureData(for annotation: PDFAnnotation) -> Data? {
+        if let stamp = annotation as? ImageStampAnnotation, let data = stamp.imageSnapshot?.pngData() {
+            return data
+        }
+        if let contents = annotation.contents,
+           let data = contents.data(using: .utf8),
+           let json = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
+           let b64 = json["imageDataB64"] as? String,
+           let imgData = Data(base64Encoded: b64) {
+            return imgData
+        }
+        return nil
     }
     
     private func confirmSaveWithDifferentSignatures() {
@@ -723,7 +813,9 @@ struct DocumentReviewView: View {
         activeAnnotationPageIndex = pageIndex
         editingPlacement = placement // Store separately, not in signaturePlacements
         isPlacingSignature = false
-        hasPendingChanges = true // Mark as dirty since we're editing
+        hasPendingChanges = false // only mark dirty on actual edits
+        registerSavedAnnotationUndoSnapshot(for: pageIndex, placement: placement)
+        savedAnnotationRedoStack[pageIndex] = []
         redoStack[pageIndex] = []
         pdfRefreshID = UUID()
     }
@@ -804,6 +896,8 @@ struct DocumentReviewView: View {
             self.editingPlacement = nil
             isPlacingSignature = false
             hasPendingChanges = false
+            savedAnnotationUndoStack[pageIndex] = []
+            savedAnnotationRedoStack[pageIndex] = []
             
             // Persist only if requested
             if persistToDisk, let data = pdfDocument.dataRepresentation() {
@@ -873,6 +967,23 @@ struct DocumentReviewView: View {
     }
     
     // Bulk save removed for simplicity; saving happens per page as needed
+    
+    private func discardChangesAndReload() {
+        // Reload from disk to discard in-memory edits
+        loadPDF()
+        signaturePlacements = [:]
+        activePlacementID = [:]
+        undoStack = [:]
+        redoStack = [:]
+        savedAnnotationUndoStack = [:]
+        savedAnnotationRedoStack = [:]
+        activeAnnotation = nil
+        activeAnnotationPageIndex = nil
+        editingPlacement = nil
+        isPlacingSignature = false
+        hasPendingChanges = false
+        pdfRefreshID = UUID()
+    }
     
     private func deletePlacement(id: UUID) {
         registerUndoSnapshot(for: currentPageIndex)
@@ -1030,6 +1141,16 @@ struct DocumentReviewView: View {
         }
     }
     
+    private func registerSavedAnnotationUndoSnapshot(for pageIndex: Int, placement: SignaturePlacement? = nil) {
+        guard let current = placement ?? editingPlacement else { return }
+        var stack = savedAnnotationUndoStack[pageIndex] ?? []
+        if stack.last != current {
+            stack.append(current)
+            savedAnnotationUndoStack[pageIndex] = stack
+            savedAnnotationRedoStack[pageIndex] = []
+        }
+    }
+    
     private func applySnapshot(for pageIndex: Int, placements: [SignaturePlacement]) {
         signaturePlacements[pageIndex] = placements
         activePlacementID[pageIndex] = placements.isEmpty ? nil : placements.last?.id
@@ -1037,6 +1158,21 @@ struct DocumentReviewView: View {
     }
     
     private func undoAction(for pageIndex: Int) {
+        if let annotation = activeAnnotation,
+           let placement = editingPlacement,
+           let pdfDocument = pdfDocument,
+           let page = pdfDocument.page(at: pageIndex) {
+            guard var savedStack = savedAnnotationUndoStack[pageIndex], let previous = savedStack.popLast() else { return }
+            let current = placement
+            savedAnnotationUndoStack[pageIndex] = savedStack
+            savedAnnotationRedoStack[pageIndex, default: []].append(current)
+            editingPlacement = previous
+            applyPlacement(previous, to: annotation, on: page)
+            hasPendingChanges = true
+            pdfRefreshID = UUID()
+            return
+        }
+        
         guard var stack = undoStack[pageIndex], let previous = stack.popLast() else { return }
         let current = signaturePlacements[pageIndex] ?? []
         undoStack[pageIndex] = stack
@@ -1045,6 +1181,21 @@ struct DocumentReviewView: View {
     }
     
     private func redoAction(for pageIndex: Int) {
+        if let annotation = activeAnnotation,
+           let placement = editingPlacement,
+           let pdfDocument = pdfDocument,
+           let page = pdfDocument.page(at: pageIndex) {
+            guard var stack = savedAnnotationRedoStack[pageIndex], let next = stack.popLast() else { return }
+            let current = placement
+            savedAnnotationRedoStack[pageIndex] = stack
+            savedAnnotationUndoStack[pageIndex, default: []].append(current)
+            editingPlacement = next
+            applyPlacement(next, to: annotation, on: page)
+            hasPendingChanges = true
+            pdfRefreshID = UUID()
+            return
+        }
+        
         guard var stack = redoStack[pageIndex], let next = stack.popLast() else { return }
         let current = signaturePlacements[pageIndex] ?? []
         redoStack[pageIndex] = stack
@@ -1461,6 +1612,7 @@ struct SavedSignatureSelectionOverlay: View {
     let pdfDocument: PDFDocument
     @Binding var placement: DocumentReviewView.SignaturePlacement
     let onDelete: () -> Void
+    let onGestureStart: () -> Void
     
     @State private var isSelected = true
     @State private var showColorPicker = false
@@ -1525,7 +1677,7 @@ struct SavedSignatureSelectionOverlay: View {
                                 tempRotation = nil
                                 initialRotation = nil
                             },
-                            onGestureStart: { }
+                            onGestureStart: { onGestureStart() }
                         )
                         
                         FloatingToolbarViewInline(
@@ -1537,7 +1689,7 @@ struct SavedSignatureSelectionOverlay: View {
                             onColor: { showColorPicker = true },
                             onDelete: onDelete,
                             onDuplicate: { },
-                            onMoveStart: { },
+                            onMoveStart: { onGestureStart() },
                             onMoveChanged: { newPos in
                                 tempPosition = newPos
                             },
