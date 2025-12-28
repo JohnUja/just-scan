@@ -469,12 +469,12 @@ struct DocumentReviewView: View {
                     }
                     
                     ToolbarItemGroup(placement: .navigationBarTrailing) {
-                        Button(action: { appendNewPlacement() }) {
+                            Button(action: { appendNewPlacement() }) {
                             Image(systemName: "plus.circle")
                         }
-                        Button("Save") {
-                            saveSignatureToPage(pageIndex: currentPageIndex, persistToDisk: true)
-                        }
+                            Button("Save") {
+                                saveSignatureToPage(pageIndex: currentPageIndex, persistToDisk: true)
+                            }
                         .fontWeight(.semibold)
                     }
                 } else {
@@ -663,7 +663,7 @@ struct DocumentReviewView: View {
             image = stamp.imageSnapshot
         }
         
-        // Fallback: parse contents JSON for base64 image
+        // Parse contents JSON for stored image/metadata
         if image == nil, let contents = annotation.contents,
            let data = contents.data(using: .utf8),
            let json = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any] {
@@ -675,9 +675,8 @@ struct DocumentReviewView: View {
             }
         }
         
-        // Final fallback: use current signature image or create placeholder
-        // This ensures plain PDFAnnotations are still editable
-        let finalImage = image ?? signatureService.signatureImage ?? UIImage()
+        // If we cannot recover the stored image, treat as non-editable
+        guard let finalImage = image else { return nil }
         
         let center = CGPoint(
             x: bounds.midX / pageRect.width,
@@ -705,38 +704,7 @@ struct DocumentReviewView: View {
         guard annotation.userName == "Signature" else { return }
         
         // Create a placement from the annotation for editing
-        guard let placement = placement(from: annotation, on: page) else {
-            // Fallback: create minimal placement from bounds if parsing fails
-            let pageRect = page.bounds(for: .mediaBox)
-            let bounds = annotation.bounds
-            let center = CGPoint(
-                x: bounds.midX / pageRect.width,
-                y: bounds.midY / pageRect.height
-            )
-            let widthRatio = bounds.width / pageRect.width
-            let aspectRatio = bounds.width > 0 ? bounds.width / bounds.height : 2.0
-            
-            // Use current signature image or a placeholder
-            let sigImage = signatureService.signatureImage ?? UIImage()
-            let fallbackPlacement = SignaturePlacement(
-                center: center,
-                widthRatio: widthRatio,
-                rotation: 0,
-                color: .black,
-                aspectRatio: aspectRatio,
-                signatureImage: sigImage
-            )
-            
-            // Set up for in-place editing - DO NOT add to signaturePlacements array
-            activeAnnotation = annotation
-            activeAnnotationPageIndex = pageIndex
-            editingPlacement = fallbackPlacement // Store separately, not in signaturePlacements
-            isPlacingSignature = false
-            hasPendingChanges = true // Mark as dirty since we're editing
-            redoStack[pageIndex] = []
-            pdfRefreshID = UUID()
-            return
-        }
+        guard let placement = placement(from: annotation, on: page) else { return }
         
         // If the annotation is not our custom type, replace it once with a mutable stamp
         let targetAnnotation: PDFAnnotation
@@ -820,7 +788,7 @@ struct DocumentReviewView: View {
         }
     }
     
-    private func saveSignatureToPage(pageIndex: Int, persistToDisk: Bool = false) {
+    private func saveSignatureToPage(pageIndex: Int, persistToDisk: Bool = true) {
         guard let pdfDocument = pdfDocument, let page = pdfDocument.page(at: pageIndex) else { return }
         
         // If editing a saved annotation in-place, commit changes to it
