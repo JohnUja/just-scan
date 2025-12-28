@@ -85,7 +85,7 @@ struct DocumentReviewView: View {
             saveSignatureToPage(pageIndex: currentPageIndex, persistToDisk: false)
         }
         
-        let proceedShare: () -> Void = { [document] in
+        let proceedShare: () -> Void = {
             guard let data = pdfDocument.dataRepresentation() else {
                 return
             }
@@ -420,9 +420,7 @@ struct DocumentReviewView: View {
                             // Immediately apply to annotation
                             if let page = pdfDocument.page(at: currentPageIndex),
                                let annotation = self.activeAnnotation {
-                                if let updated = applyPlacement(newValue, to: annotation, on: page) {
-                                    self.activeAnnotation = updated
-                                }
+                                _ = applyPlacement(newValue, to: annotation, on: page)
                                 hasPendingChanges = true
                                 pdfRefreshID = UUID() // Trigger refresh
                             }
@@ -430,8 +428,8 @@ struct DocumentReviewView: View {
                     ),
                     onDelete: {
                         // Delete the annotation directly
-            if let page = pdfDocument.page(at: currentPageIndex),
-               let annotation = activeAnnotation {
+            if let page = pdfDocument.page(at: currentPageIndex) {
+                let annotation = activeAnnotation
                 page.removeAnnotation(annotation)
             }
             self.activeAnnotation = nil
@@ -1071,15 +1069,6 @@ struct DocumentReviewView: View {
             let page = pdfDocument.page(at: pageIndex),
             let annotation = activeAnnotation
         else {
-            // If no editing placement, check if there are unsaved overlays to commit
-            if let pageIndex = activeAnnotationPageIndex,
-               let placementID = activePlacementID[pageIndex] ?? signaturePlacements[pageIndex]?.first?.id,
-               let placement = signaturePlacements[pageIndex]?.first(where: { $0.id == placementID }),
-               let pdfDocument = pdfDocument,
-               let page = pdfDocument.page(at: pageIndex) {
-                // This is for unsaved overlays, not saved annotation editing
-                // Don't commit here, let saveSignatureToPage handle it
-            }
             activeAnnotation = nil
             activeAnnotationPageIndex = nil
             editingPlacement = nil
@@ -1167,7 +1156,7 @@ struct DocumentReviewView: View {
             savedAnnotationUndoStack[pageIndex] = savedStack
             savedAnnotationRedoStack[pageIndex, default: []].append(current)
             editingPlacement = previous
-            applyPlacement(previous, to: annotation, on: page)
+            _ = applyPlacement(previous, to: annotation, on: page)
             hasPendingChanges = true
             pdfRefreshID = UUID()
             return
@@ -1190,7 +1179,7 @@ struct DocumentReviewView: View {
             savedAnnotationRedoStack[pageIndex] = stack
             savedAnnotationUndoStack[pageIndex, default: []].append(current)
             editingPlacement = next
-            applyPlacement(next, to: annotation, on: page)
+            _ = applyPlacement(next, to: annotation, on: page)
             hasPendingChanges = true
             pdfRefreshID = UUID()
             return
