@@ -12,6 +12,8 @@ import CoreImage
 
 struct DocumentReviewView: View {
     let document: Document
+    @State private var activeFileURL: URL
+    @State private var currentFileName: String
     @Environment(\.dismiss) var dismiss
     @StateObject private var signatureService = SignatureService.shared
     
@@ -45,6 +47,9 @@ struct DocumentReviewView: View {
     @State private var showExitPrompt: Bool = false
     @State private var showDocumentSignatureWarning: Bool = false
     @State private var pendingShareAction: (() -> Void)? = nil
+    @State private var showRenameSheet: Bool = false
+    @State private var renameInput: String = ""
+    @State private var renameError: String?
     
     // Undo/redo stacks per page (snapshots of placements)
     @State private var undoStack: [Int: [[SignaturePlacement]]] = [:]
@@ -73,6 +78,12 @@ struct DocumentReviewView: View {
             lhs.color == rhs.color &&
             lhs.aspectRatio == rhs.aspectRatio
         }
+    }
+    
+    init(document: Document) {
+        self.document = document
+        _activeFileURL = State(initialValue: document.fileURL)
+        _currentFileName = State(initialValue: document.fileName)
     }
     
     private func secureAndShare() {
@@ -256,6 +267,34 @@ struct DocumentReviewView: View {
                 }
                 .sheet(isPresented: $showOCROverlay) {
                     OCRResultView(text: ocrText)
+                }
+                .sheet(isPresented: $showRenameSheet) {
+                    VStack(alignment: .leading, spacing: 16) {
+                        Text("Rename Document")
+                            .font(.headline)
+                        TextField("File name", text: $renameInput)
+                            .textFieldStyle(RoundedBorderTextFieldStyle())
+                            .autocapitalization(.none)
+                            .disableAutocorrection(true)
+                        if let renameError {
+                            Text(renameError)
+                                .foregroundColor(.red)
+                                .font(.footnote)
+                        }
+                        HStack {
+                            Button("Cancel") {
+                                showRenameSheet = false
+                                renameError = nil
+                            }
+                            Spacer()
+                            Button("Save") {
+                                performRename()
+                            }
+                            .fontWeight(.semibold)
+                        }
+                    }
+                    .padding()
+                    .presentationDetents([.medium])
                 }
                 .onAppear {
                     loadPDF()
@@ -530,6 +569,11 @@ struct DocumentReviewView: View {
                 Button(action: { appendNewPlacement() }) {
                     Image(systemName: "plus.circle")
                 }
+                Button {
+                    openRenamePrompt()
+                } label: {
+                    Image(systemName: "pencil")
+                }
                 Button("Save") {
                     saveSignatureToPage(pageIndex: currentPageIndex, persistToDisk: true)
                 }
@@ -563,6 +607,12 @@ struct DocumentReviewView: View {
                     .disabled(ocrCoordinator.isProcessing)
                 
                 Button { showSignatureOptions = true } label: { Image(systemName: "signature") }
+                
+                Button {
+                    openRenamePrompt()
+                } label: {
+                    Image(systemName: "pencil")
+                }
                 
                 Menu {
                     Section("Export Options") {
@@ -661,6 +711,36 @@ struct DocumentReviewView: View {
         )
     }
     
+    private func openRenamePrompt() {
+        renameInput = currentFileName.replacingOccurrences(of: ".pdf", with: "")
+        renameError = nil
+        showRenameSheet = true
+    }
+    
+    private func performRename() {
+        let trimmed = renameInput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            renameError = "Name cannot be empty."
+            return
+        }
+        
+        var newName = trimmed
+        if !newName.lowercased().hasSuffix(".pdf") {
+            newName += ".pdf"
+        }
+        
+        do {
+            try DocumentService.shared.renameDocument(document, newName: newName)
+            activeFileURL = activeFileURL.deletingLastPathComponent().appendingPathComponent(newName)
+            currentFileName = newName
+            loadPDF()
+            showRenameSheet = false
+            renameError = nil
+        } catch {
+            renameError = error.localizedDescription
+        }
+    }
+    
     private func shouldWarnAboutDifferentSignatures(placements: [SignaturePlacement], page: PDFPage, pageIndex: Int) -> Bool {
         var signatureHashes: Set<String> = []
         
@@ -734,7 +814,7 @@ struct DocumentReviewView: View {
         }
         
         if let data = pdfDocument.dataRepresentation() {
-            try? data.write(to: document.fileURL, options: .atomic)
+            try? data.write(to: activeFileURL, options: .atomic)
             NotificationCenter.default.post(name: .init("RefreshDocumentThumbnails"), object: nil)
         }
         
@@ -845,13 +925,14 @@ struct DocumentReviewView: View {
     
     private var navigationTitle: String {
         if let pdfDoc = pdfDocument, pdfDoc.pageCount > 1 {
-            return "\(document.fileName) (\(currentPageIndex + 1)/\(pdfDoc.pageCount))"
+            return "\(currentFileName) (\(currentPageIndex + 1)/\(pdfDoc.pageCount))"
         }
-        return document.fileName
+        return currentFileName
     }
     
     private func loadPDF() {
-        guard let fileURL = document.fileURL as URL?, FileManager.default.fileExists(atPath: fileURL.path) else { return }
+        let fileURL = activeFileURL
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
         let savedPageIndex = currentPageIndex
         if let newPDF = PDFDocument(url: fileURL), newPDF.pageCount > 0 {
             pdfDocument = newPDF
@@ -888,7 +969,7 @@ struct DocumentReviewView: View {
     private func applyFilter(_ filterType: FilterType) {
         guard let pdfDocument = pdfDocument else { return }
         let filteredPDF = DocumentService.shared.applyFilter(to: pdfDocument, filterType: filterType)
-        if filteredPDF.write(to: document.fileURL) {
+        if filteredPDF.write(to: activeFileURL) {
             self.pdfDocument = filteredPDF
             selectedFilter = filterType
         }
@@ -915,7 +996,7 @@ struct DocumentReviewView: View {
             
             // Persist only if requested
             if persistToDisk, let data = pdfDocument.dataRepresentation() {
-                try? data.write(to: document.fileURL, options: .atomic)
+                try? data.write(to: activeFileURL, options: .atomic)
                 NotificationCenter.default.post(name: .init("RefreshDocumentThumbnails"), object: nil)
             }
             pdfRefreshID = UUID()
@@ -928,7 +1009,7 @@ struct DocumentReviewView: View {
             // No unsaved signatures. If there are pending changes (e.g., deletion), persist them.
             if hasPendingChanges {
                 if persistToDisk, let data = pdfDocument.dataRepresentation() {
-                    try? data.write(to: document.fileURL, options: .atomic)
+                    try? data.write(to: activeFileURL, options: .atomic)
                     NotificationCenter.default.post(name: .init("RefreshDocumentThumbnails"), object: nil)
                 }
                 hasPendingChanges = false
@@ -962,7 +1043,7 @@ struct DocumentReviewView: View {
         
         // Save to disk only when requested
         if persistToDisk, let data = pdfDocument.dataRepresentation() {
-            try? data.write(to: document.fileURL, options: .atomic)
+            try? data.write(to: activeFileURL, options: .atomic)
             NotificationCenter.default.post(name: .init("RefreshDocumentThumbnails"), object: nil)
         }
         
@@ -984,7 +1065,7 @@ struct DocumentReviewView: View {
         }
         
         if let data = pdfDocument.dataRepresentation() {
-            try? data.write(to: document.fileURL, options: .atomic)
+            try? data.write(to: activeFileURL, options: .atomic)
             NotificationCenter.default.post(name: .init("RefreshDocumentThumbnails"), object: nil)
         }
     }
