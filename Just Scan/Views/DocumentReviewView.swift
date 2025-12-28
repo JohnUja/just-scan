@@ -726,7 +726,23 @@ struct DocumentReviewView: View {
             return
         }
         
-        performSave(placements: placements, pageIndex: pageIndex, page: page)
+        // Add pending placements as annotations and persist
+        for placement in placements {
+            if let annotation = makeAnnotation(from: placement, on: page) {
+                page.addAnnotation(annotation)
+            }
+        }
+        
+        if let data = pdfDocument.dataRepresentation() {
+            try? data.write(to: document.fileURL, options: .atomic)
+            NotificationCenter.default.post(name: .init("RefreshDocumentThumbnails"), object: nil)
+        }
+        
+        signaturePlacements[pageIndex] = []
+        activePlacementID[pageIndex] = nil
+        isPlacingSignature = false
+        hasPendingChanges = false
+        pdfRefreshID = UUID()
         pendingSavePlacements = nil
         pendingSavePageIndex = nil
         showSignatureWarning = false
@@ -961,7 +977,16 @@ struct DocumentReviewView: View {
     private func performSave(placements: [SignaturePlacement], pageIndex: Int, page: PDFPage) {
         guard let pdfDocument = pdfDocument else { return }
         
-        // Deprecated: no longer used for incremental saves
+        for placement in placements {
+            if let annotation = makeAnnotation(from: placement, on: page) {
+                page.addAnnotation(annotation)
+            }
+        }
+        
+        if let data = pdfDocument.dataRepresentation() {
+            try? data.write(to: document.fileURL, options: .atomic)
+            NotificationCenter.default.post(name: .init("RefreshDocumentThumbnails"), object: nil)
+        }
     }
     
     // Bulk save removed for simplicity; saving happens per page as needed
@@ -1436,6 +1461,8 @@ struct InlineSignatureOverlay: View {
                             onMoveStart: { },
                             onMoveChanged: { newPos in
                                 tempPosition = newPos
+                                // Immediately update placement to keep annotation in sync while dragging
+                                placement.center = newPos
                             },
                             onMoveEnded: {
                                 if let finalPos = tempPosition {
