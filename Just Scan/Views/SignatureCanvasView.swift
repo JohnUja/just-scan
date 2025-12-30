@@ -21,6 +21,7 @@ struct SignatureCanvasView: View {
     // ✅ Stroke customization
     @State private var strokeWidth: CGFloat = 3.0
     @State private var showStrokeOptions = false
+    @State private var showMaxSignaturesAlert = false
     
     init(onSave: (() -> Void)? = nil) {
         self.onSave = onSave
@@ -140,6 +141,11 @@ struct SignatureCanvasView: View {
                     Button("Cancel") { dismiss() }
                 }
             }
+            .alert("Maximum Signatures Reached", isPresented: $showMaxSignaturesAlert) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text("You can only have up to 5 signatures. Please delete an existing signature before creating a new one.")
+            }
         }
     }
     
@@ -218,11 +224,14 @@ struct SignatureCanvasView: View {
             }
         }
         
-        signatureService.saveSignature(image)
-        dismiss()
-        
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-            onSave?()
+        if signatureService.saveSignature(image) {
+            dismiss()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                onSave?()
+            }
+        } else {
+            // Show alert for maximum signature limit
+            showMaxSignaturesAlert = true
         }
     }
 }

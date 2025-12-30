@@ -4,32 +4,53 @@ import PDFKit
 struct UnsavedSignatureOverlay: View {
     let pageIndex: Int
     let pdfDocument: PDFDocument
+    let pdfViewInstance: PDFView?  // PDFView instance for coordinate conversion
     let signatureImage: UIImage
     let placement: DocumentReviewView.SignaturePlacement
     let showImage: Bool
     
     var body: some View {
-        GeometryReader { geometry in
-            if let page = pdfDocument.page(at: pageIndex) {
-                let transform = DocumentReviewView.PDFPageTransform(page: page, viewSize: geometry.size)
-                let center = transform.viewPoint(from: placement.center)
-                let size = transform.viewSize(widthRatio: placement.widthRatio, aspectRatio: placement.aspectRatio)
+        GeometryReader { _ in
+            // DEPRECATED: UnsavedSignatureOverlay is no longer used - replaced by UnifiedSignatureOverlay
+            // This struct is kept for reference but should not be called
+            // If it needs to be used, it should be updated to use pdfView.convert like UnifiedSignatureOverlay
+            if let page = pdfDocument.page(at: pageIndex),
+               let pdfView = pdfViewInstance,
+               pdfView.scaleFactor > 0 {
+                let pageBounds = page.bounds(for: .mediaBox)
+                let currentScale = pdfView.scaleFactor
                 
-                ZStack {
-                    if showImage {
-                        Image(uiImage: tinted(signatureImage, color: placement.color))
-                            .resizable()
-                            .aspectRatio(contentMode: .fit)
-                            .frame(width: size.width, height: size.height)
-                            .rotationEffect(.degrees(placement.rotation))
-                            .contentShape(Rectangle())
-                    } else {
-                        // no image; area remains hittable if wrapped by parent
-                        Color.clear
-                            .frame(width: size.width, height: size.height)
+                // Calculate PDF point from normalized placement
+                let pdfPoint = CGPoint(
+                    x: placement.center.x * pageBounds.width,
+                    y: placement.center.y * pageBounds.height
+                )
+                
+                // Convert to screen coordinates using native PDFKit conversion
+                let center = pdfView.convert(pdfPoint, from: page)
+                
+                // Scale visual size by zoom level
+                let visualWidth = (pageBounds.width * placement.widthRatio) * currentScale
+                let visualHeight = visualWidth / placement.aspectRatio
+                
+                // Only render if coordinate is valid
+                if center != .zero {
+                    ZStack {
+                        if showImage {
+                            Image(uiImage: tinted(signatureImage, color: placement.color))
+                                .resizable()
+                                .aspectRatio(contentMode: .fit)
+                                .frame(width: visualWidth, height: visualHeight)
+                                .rotationEffect(.degrees(placement.rotation))
+                                .contentShape(Rectangle())
+                        } else {
+                            // no image; area remains hittable if wrapped by parent
+                            Color.clear
+                                .frame(width: visualWidth, height: visualHeight)
+                        }
                     }
+                    .position(center)
                 }
-                .position(center)
             }
         }
     }

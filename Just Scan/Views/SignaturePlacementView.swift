@@ -24,6 +24,8 @@ struct SignaturePlacementView: View {
     
     @State private var pdfDocument: PDFDocument?
     @State private var currentPageIndex = 0
+    @State private var pdfViewInstance: PDFView? = nil  // Reference to PDFView for coordinate conversion
+    @State private var zoomRefreshID = UUID()  // Forces SwiftUI to recalculate signature positions during zoom
     
     // Normalized coordinates (0.0 to 1.0) - much simpler!
     @State private var signaturePosition: CGPoint = CGPoint(x: 0.5, y: 0.5)
@@ -102,7 +104,9 @@ struct SignaturePlacementView: View {
                     // PDF View
                     PDFViewRepresentable(
                         pdfDocument: pdfDocument,
-                        pageIndex: $currentPageIndex
+                        pageIndex: $currentPageIndex,
+                        pdfViewInstance: $pdfViewInstance,
+                        refreshTrigger: $zoomRefreshID  // Pass the zoom refresh trigger
                     )
                     .ignoresSafeArea()
                     

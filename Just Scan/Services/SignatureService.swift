@@ -57,7 +57,12 @@ class SignatureService: ObservableObject {
     }
     
     
-    func saveSignature(_ image: UIImage, name: String? = nil) {
+    func saveSignature(_ image: UIImage, name: String? = nil) -> Bool {
+        // Enforce maximum of 5 signatures
+        if signatureHistory.count >= 5 {
+            return false
+        }
+        
         let signature = SavedSignature(
             id: UUID(),
             image: image,
@@ -66,7 +71,7 @@ class SignatureService: ObservableObject {
         )
         
         // Save image
-        guard let data = image.pngData() else { return }
+        guard let data = image.pngData() else { return false }
         let fileURL = signatureURL(for: signature.id)
         
         do {
@@ -75,8 +80,10 @@ class SignatureService: ObservableObject {
             currentSignatureID = signature.id
             saveMetadata()
             objectWillChange.send()
+            return true
         } catch {
             print("❌ Failed to save signature: \(error)")
+            return false
         }
     }
     
@@ -116,7 +123,7 @@ class SignatureService: ObservableObject {
             return
         }
         
-        saveSignature(image, name: "Migrated Signature")
+        _ = saveSignature(image, name: "Migrated Signature")
         try? fileManager.removeItem(at: oldURL)
     }
     
