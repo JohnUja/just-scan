@@ -36,7 +36,6 @@ struct DocumentReviewView: View {
     @State private var showSignatureWarning: Bool = false
     @State private var pendingSavePlacements: [SignaturePlacement]? = nil
     @State private var pendingSavePageIndex: Int? = nil
-    @State private var pdfRefreshID = UUID()
     @State private var zoomRefreshID = UUID()  // Forces SwiftUI to recalculate signature positions during zoom
     @State private var pdfViewInstance: PDFView? = nil  // Reference to PDFView for coordinate conversion
     @State private var activeAnnotation: PDFAnnotation? = nil
@@ -44,6 +43,8 @@ struct DocumentReviewView: View {
     @State private var editingPlacement: SignaturePlacement? = nil // Separate state for saved annotation editing
     @State private var savedAnnotationUndoStack: [Int: [SignaturePlacement]] = [:]
     @State private var savedAnnotationRedoStack: [Int: [SignaturePlacement]] = [:]
+    // ROOT FIX: Selection is UI state, not document state - removed from undo/redo stack
+    // (Selection changes should not pollute undo/redo which is for actual edits: move/resize/rotate/delete/add)
     @State private var showExitPrompt: Bool = false
     @State private var showDocumentSignatureWarning: Bool = false
     @State private var pendingShareAction: (() -> Void)? = nil
@@ -54,6 +55,26 @@ struct DocumentReviewView: View {
     @State private var redoStack: [Int: [[SignaturePlacement]]] = [:]
     
     @StateObject private var ocrCoordinator = OCRCoordinator()
+    
+    // ROOT FIX: Use PDFAnnotationKey.name for reliable signature identification (persists across saves)
+    private let signatureAnnotationName = "JustScanSignature_v1"
+    
+    // Helper to identify signature annotations (uses persisted .name key + contents fallback)
+    private func isSignatureAnnotation(_ ann: PDFAnnotation) -> Bool {
+        // 1) Strongest persisted marker: /NM (PDFAnnotationKey.name)
+        if let name = ann.value(forAnnotationKey: .name) as? String,
+           name == signatureAnnotationName {
+            return true
+        }
+        
+        // 2) Fallback: our JSON marker in /Contents
+        if let contents = ann.contents,
+           contents.contains("\"imageDataB64\"") {
+            return true
+        }
+        
+        return false
+    }
     
     // Signature placement data structure
     struct SignaturePlacement: Identifiable, Equatable {
@@ -67,6 +88,18 @@ struct DocumentReviewView: View {
         var color: SignatureColor
         var aspectRatio: CGFloat
         let signatureImage: UIImage
+        let imageHash: Int  // CRITICAL FIX: Hash for equality comparison (prevents undo/redo snapshot issues)
+        
+        init(center: CGPoint, widthRatio: CGFloat, rotation: CGFloat, 
+             color: SignatureColor, aspectRatio: CGFloat, signatureImage: UIImage) {
+            self.center = center
+            self.widthRatio = widthRatio
+            self.rotation = rotation
+            self.color = color
+            self.aspectRatio = aspectRatio
+            self.signatureImage = signatureImage
+            self.imageHash = signatureImage.pngData()?.hashValue ?? 0
+        }
         
         static func == (lhs: SignaturePlacement, rhs: SignaturePlacement) -> Bool {
             lhs.id == rhs.id &&
@@ -74,7 +107,8 @@ struct DocumentReviewView: View {
             lhs.widthRatio == rhs.widthRatio &&
             lhs.rotation == rhs.rotation &&
             lhs.color == rhs.color &&
-            lhs.aspectRatio == rhs.aspectRatio
+            lhs.aspectRatio == rhs.aspectRatio &&
+            lhs.imageHash == rhs.imageHash  // CRITICAL FIX: Include image hash in equality
         }
     }
     
@@ -191,7 +225,7 @@ struct DocumentReviewView: View {
                 .sheet(isPresented: $showSignatureCanvas) {
                     SignatureCanvasView(onSave: {
                         if signatureService.hasSignature {
-                            appendNewPlacementIfNeeded()
+                            addNewPlacement()
                             isPlacingSignature = true
                         }
                     })
@@ -205,7 +239,7 @@ struct DocumentReviewView: View {
                 .confirmationDialog("Signature", isPresented: $showSignatureOptions) {
                     if signatureService.hasSignature {
                         Button("Insert Signature") {
-                            appendNewPlacement()
+                            addNewPlacement()
                         }
                         Button("Preview Signature") { showSignaturePreview = true }
                         Button("Edit Signature") { showSignatureCanvas = true }
@@ -226,6 +260,11 @@ struct DocumentReviewView: View {
                 }
                 .onAppear {
                     loadPDF()
+                }
+                .onDisappear {
+                    // CRITICAL FIX: Cleanup timer to prevent memory leaks and redraw spam
+                    refreshTimer?.invalidate()
+                    refreshTimer = nil
                 }
                 .onChange(of: ocrCoordinator.resultText) { newValue in
                     if let text = newValue {
@@ -262,14 +301,9 @@ struct DocumentReviewView: View {
                     Button("Save") {
                         // Save all pages with buffered signatures
                         finalCommitToPDF()
-                        // Ensure annotation is visible again when editing ends
-                        if let annotation = activeAnnotation {
-                            annotation.shouldDisplay = true
-                        }
-                        activeAnnotation = nil
-                        activeAnnotationPageIndex = nil
+                        // Exit edit mode cleanly (ensures annotation visibility is restored)
+                        setEditingAnnotation(nil, pageIndex: nil)
                         editingPlacement = nil
-                        pdfViewInstance?.setNeedsDisplay()
                         dismiss()
                     }
                     Button("Discard", role: .destructive) {
@@ -332,29 +366,47 @@ struct DocumentReviewView: View {
                             // 1. BOTTOM LAYER: The PDF Document
                             pdfView(pdfDocument)
                                 .shadow(color: .black.opacity(0.15), radius: 10, y: 5)
-                                .allowsHitTesting(true)
-                            
-                            // 2. MIDDLE LAYER: Detection for SAVED signatures
-                            // We only enable this hit-testing if we aren't currently editing one
+                                        .allowsHitTesting(true)
+                                // CRITICAL FIX: Tap router must be attached to the PDF layer only.
+                                // Attaching it to the parent ZStack causes toolbar taps to also trigger handleTap(),
+                                // which can rapidly deselect/reselect and create a runaway update loop.
+                                .simultaneousGesture(
+                                    DragGesture(minimumDistance: 0)
+                                        .onEnded { value in
+                                            handleTap(locationInView: value.location)
+                                        }
+                                )
+
+                            // 2. MIDDLE LAYER: Saved signature hit-zones (enables instant switching even while editing)
+                            // This fixes the "tap signature A then can't tap signature B until Save" feeling.
                             SavedSignatureOverlay(
-                                pdfDocument: pdfDocument,
+                                        pdfDocument: pdfDocument,
                                 pageIndex: currentPageIndex,
                                 pdfViewInstance: pdfViewInstance,
                                 selectedSignature: .constant(nil),
                                 currentlyEditingAnnotation: activeAnnotation,
                                 onDelete: { _ in },
                                 onEdit: { annotation in
-                                    // commit current edits in memory before switching
+                                    // Commit current edit and switch immediately
                                     commitActiveEditInMemory()
+                                    setEditingAnnotation(nil, pageIndex: nil)
+                                    editingPlacement = nil
                                     beginEditing(annotation: annotation, pageIndex: currentPageIndex)
                                 }
                             )
-                            .allowsHitTesting(activeAnnotation == nil && (signaturePlacements[currentPageIndex]?.isEmpty ?? true))
+                                        .allowsHitTesting(true)
                             
                             // 3. TOP LAYER: The active signature sticker and handles
                             signatureOverlay(pdfDocument: pdfDocument)
-                                .id(zoomRefreshID)  // ROOT FIX: Forces glue-to-paper during zoom
+                                // ROOT FIX: Unique ID per page prevents mirroring; zoomRefreshID keeps it glued during zoom
+                                .id("page-\(currentPageIndex)-\(zoomRefreshID)")
+                                // ROOT FIX: Only block touches when we have active signatures to edit
+                                .allowsHitTesting(
+                                    activeAnnotation != nil || 
+                                    !(signaturePlacements[currentPageIndex]?.isEmpty ?? true)
+                                )
                         }
+                        // Tap router moved to the PDF layer above (so toolbar taps don't trigger it).
                 
                 paginationBar(for: pdfDocument)
             }
@@ -371,6 +423,7 @@ struct DocumentReviewView: View {
             pdfViewInstance: $pdfViewInstance,
             refreshTrigger: $zoomRefreshID,  // Pass the zoom refresh trigger
             disableTapGestures: false // Always allow PDF taps
+            // ROOT FIX: Background tap is now handled by tap router gesture on ZStack (removed parameter)
         )
         .ignoresSafeArea()
     }
@@ -395,14 +448,21 @@ struct DocumentReviewView: View {
                     placement: Binding(
                         get: { placement },
                         set: { newValue in
+                            let oldRotation = editingPlacement?.rotation ?? 0
                             editingPlacement = newValue
                             // Immediately apply to annotation
                             if let page = pdfDocument.page(at: currentPageIndex),
                                    let annotation = self.activeAnnotation {
                                     _ = applyPlacement(newValue, to: annotation, on: page)
                                 hasPendingChanges = true
-                                    // Throttle PDF refresh to avoid lag during drag
-                                    schedulePDFRefresh()
+                                    // For rotation changes, update immediately; for position/size, throttle
+                                    if abs(newValue.rotation - oldRotation) > 0.1 {
+                                        // Rotation changed - update immediately
+                                        pdfViewInstance?.setNeedsDisplay()
+                                    } else {
+                                        // Position/size changed - throttle to avoid lag during drag
+                                        schedulePDFRefresh()
+                                    }
                             }
                         }
                     ),
@@ -416,82 +476,45 @@ struct DocumentReviewView: View {
                             annotation.shouldDisplay = true
                             page.removeAnnotation(annotation)
                         }
-                        self.activeAnnotation = nil
-                        self.activeAnnotationPageIndex = nil
-                        self.editingPlacement = nil
-                        isPlacingSignature = false
-                        hasPendingChanges = true
+                            self.activeAnnotation = nil
+                            self.activeAnnotationPageIndex = nil
+                            self.editingPlacement = nil
+                            isPlacingSignature = false
+                            hasPendingChanges = true
                         savedAnnotationUndoStack[currentPageIndex] = []
                         savedAnnotationRedoStack[currentPageIndex] = []
                         pdfViewInstance?.setNeedsDisplay()
                     },
                         onGestureStart: {
-                            // Hide the PDF annotation immediately when editing starts to prevent "double vision"
-                            if let annotation = self.activeAnnotation {
-                                annotation.shouldDisplay = false
-                                pdfViewInstance?.setNeedsDisplay()
-                            }
+                            // Undo snapshot only; annotation visibility is managed centrally by setEditingAnnotation(...)
                             registerSavedAnnotationUndoSnapshot(for: currentPageIndex)
                         },
                         onDuplicate: {
-                            // Duplicate the current saved signature
-                            guard let page = pdfDocument.page(at: currentPageIndex),
-                                  let currentAnn = self.activeAnnotation,
-                                  let placement = self.editingPlacement else { return }
+                            // HARMONY: Use the same master function for duplicates
+                            guard let placement = self.editingPlacement else { return }
                             
-                            // 1. UNHIDE the original before we stop editing it
-                            currentAnn.shouldDisplay = true
+                            // Exit edit mode (shows original) before duplicating
+                            setEditingAnnotation(nil, pageIndex: nil)
+                            editingPlacement = nil
                             
-                            // 2. Create duplicate with offset so it's not hidden
-                            var duplicatePlacement = placement
-                            duplicatePlacement.center = CGPoint(
-                                x: min(0.95, placement.center.x + 0.05),
-                                y: max(0.05, placement.center.y - 0.05)
-                            )
+                            // 2. Use master function to create duplicate (handles offset automatically)
+                            addNewPlacement(from: placement)
                             
-                            if let duplicateAnnotation = makeAnnotation(from: duplicatePlacement, on: page) {
-                                page.addAnnotation(duplicateAnnotation)
-                                
-                                // 3. Switch focus to the new one
-                                var transaction = Transaction()
-                                transaction.disablesAnimations = true
-                                withTransaction(transaction) {
-                                    self.activeAnnotation = duplicateAnnotation
-                                    self.activeAnnotationPageIndex = currentPageIndex
-                                    self.editingPlacement = duplicatePlacement
-                                }
-                                
-                                // 4. HIDE the NEW one because it's now the "Active" one being edited
-                                duplicateAnnotation.shouldDisplay = false
-                                
-                                registerSavedAnnotationUndoSnapshot(for: currentPageIndex, placement: duplicatePlacement)
-                                savedAnnotationRedoStack[currentPageIndex] = []
-                                hasPendingChanges = true
-                                pdfViewInstance?.setNeedsDisplay()
-                            }
-                        },
-                        onDragStart: {
-                            // Hide the annotation during drag for smooth ghost effect
-                            if let annotation = self.activeAnnotation {
-                                annotation.shouldDisplay = false
-                                pdfViewInstance?.setNeedsDisplay()
-                            }
-                        },
-                        onDragEnd: {
-                            // Show the annotation again after drag
-                            if let annotation = self.activeAnnotation {
-                                annotation.shouldDisplay = true
-                                pdfViewInstance?.setNeedsDisplay()
-                            }
-                        }
-                    )
-                    .onDisappear {
-                        // SAFETY: If the overlay goes away, the real PDF annotation MUST show up
-                        if let annotation = self.activeAnnotation {
-                            annotation.shouldDisplay = true
+                            // 3. Stop editing the original and let the new duplicate become active
+                            self.activeAnnotation = nil
+                            self.activeAnnotationPageIndex = nil
+                            self.editingPlacement = nil
+                            
                             pdfViewInstance?.setNeedsDisplay()
-                        }
-                    }
+                        },
+                        onDragStart: nil,
+                        onDragEnd: nil,
+                        onRotationChange: {
+                            // Force immediate bounds recalculation when rotation changes
+                            commitActiveEditInMemory()
+                        },
+                        onSelectInactive: nil
+                    )
                 }
             } else {
                 // Only show overlays for NEW unsaved signatures (not editing saved)
@@ -510,9 +533,16 @@ struct DocumentReviewView: View {
                             activeAnnotation: nil,  // Unsaved signatures don't have annotations yet
                             onDelete: { deletePlacement(id: placement.id); hasPendingChanges = true },
                             onGestureStart: { registerUndoSnapshot(for: currentPageIndex); hasPendingChanges = true },
-                            onDuplicate: { appendNewPlacement(using: placement.signatureImage); hasPendingChanges = true },
+                            onDuplicate: { addNewPlacement(from: placement) },
                             onDragStart: nil,
-                            onDragEnd: nil
+                            onDragEnd: nil,
+                            onRotationChange: nil,  // Unsaved signatures don't need bounds recalculation
+                            onSelectInactive: {
+                                if !isActive {
+                                    activePlacementID[currentPageIndex] = placement.id
+                                    isPlacingSignature = true
+                                }
+                            }
                         )
                         .zIndex(z + (isActive ? 1 : 0))
                         .onTapGesture {
@@ -561,16 +591,18 @@ struct DocumentReviewView: View {
                         Button(action: { undoAction(for: currentPageIndex) }) {
                             Image(systemName: "arrow.uturn.backward.circle")
                         }
-                .disabled((undoStack[currentPageIndex]?.isEmpty ?? true) && (savedAnnotationUndoStack[currentPageIndex]?.isEmpty ?? true))
+                .disabled((undoStack[currentPageIndex]?.isEmpty ?? true) && 
+                         (savedAnnotationUndoStack[currentPageIndex]?.isEmpty ?? true))
                         
                         Button(action: { redoAction(for: currentPageIndex) }) {
                             Image(systemName: "arrow.uturn.forward.circle")
                         }
-                .disabled((redoStack[currentPageIndex]?.isEmpty ?? true) && (savedAnnotationRedoStack[currentPageIndex]?.isEmpty ?? true))
+                .disabled((redoStack[currentPageIndex]?.isEmpty ?? true) && 
+                         (savedAnnotationRedoStack[currentPageIndex]?.isEmpty ?? true))
                     }
                     
                     ToolbarItemGroup(placement: .navigationBarTrailing) {
-                        Button(action: { appendNewPlacement() }) {
+                        Button(action: { addNewPlacement() }) {
                             Image(systemName: "plus.circle")
                         }
                         Button("Save") {
@@ -587,14 +619,9 @@ struct DocumentReviewView: View {
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button("Done") {
                         commitActiveEditInMemory()
-                        // Ensure annotation is visible again when editing ends
-                        if let annotation = activeAnnotation {
-                            annotation.shouldDisplay = true
-                        }
-                        activeAnnotation = nil
-                        activeAnnotationPageIndex = nil
+                        // Exit edit mode cleanly (ensures annotation visibility is restored)
+                        setEditingAnnotation(nil, pageIndex: nil)
                         editingPlacement = nil
-                        pdfViewInstance?.setNeedsDisplay()
                         dismiss()
                     }
                 }
@@ -647,6 +674,9 @@ struct DocumentReviewView: View {
                 // Commit any edits before changing page
                 if activeAnnotation != nil && activeAnnotationPageIndex == currentPageIndex {
                     commitActiveEditInMemory()
+                    // Leaving the page while editing: restore annotation visibility and exit edit mode
+                    setEditingAnnotation(nil, pageIndex: nil)
+                    editingPlacement = nil
                 }
                 currentPageIndex = max(0, currentPageIndex - 1)
             } label: {
@@ -663,6 +693,9 @@ struct DocumentReviewView: View {
                 // Commit any edits before changing page
                 if activeAnnotation != nil && activeAnnotationPageIndex == currentPageIndex {
                     commitActiveEditInMemory()
+                    // Leaving the page while editing: restore annotation visibility and exit edit mode
+                    setEditingAnnotation(nil, pageIndex: nil)
+                    editingPlacement = nil
                 }
                 currentPageIndex = min(pdfDocument.pageCount - 1, currentPageIndex + 1)
             } label: {
@@ -688,12 +721,12 @@ struct DocumentReviewView: View {
                 return list.first(where: { $0.id == placementID }) ??
                 SignaturePlacement(
                     center: .init(x: 0.5, y: 0.5),
-                    widthRatio: 0.3,
+                    widthRatio: 0.195,  // 65% of original 0.3
                     rotation: 0,
                     color: .black,
                     aspectRatio: 2.0,
                     signatureImage: signatureService.signatureImage ?? UIImage()
-                )
+                )  // imageHash computed automatically in init
             },
             set: { newValue in
                 var list = signaturePlacements[pageIndex] ?? []
@@ -713,7 +746,7 @@ struct DocumentReviewView: View {
     private func shouldWarnAboutDifferentSignatures(placements: [SignaturePlacement], page: PDFPage, pageIndex: Int) -> Bool {
         var signatureHashes: Set<String> = []
         
-        for annotation in page.annotations where annotation.userName == "Signature" {
+        for annotation in page.annotations where isSignatureAnnotation(annotation) {
             if let data = signatureData(for: annotation) {
                 signatureHashes.insert(data.hashValue.description)
             }
@@ -738,7 +771,7 @@ struct DocumentReviewView: View {
         var signatureHashes: Set<String> = []
         for pageIndex in 0..<pdfDocument.pageCount {
             guard let page = pdfDocument.page(at: pageIndex) else { continue }
-            for annotation in page.annotations where annotation.userName == "Signature" {
+            for annotation in page.annotations where isSignatureAnnotation(annotation) {
                 if let data = signatureData(for: annotation) {
                     signatureHashes.insert(data.hashValue.description)
                     if signatureHashes.count > 1 { return true }
@@ -782,8 +815,8 @@ struct DocumentReviewView: View {
     }
     
     private func placement(from annotation: PDFAnnotation, on page: PDFPage) -> SignaturePlacement? {
-        // Only treat annotations explicitly marked as signatures
-        guard annotation.userName == "Signature" else { return nil }
+        // Only treat annotations explicitly marked as signatures (using persisted .name key)
+        guard isSignatureAnnotation(annotation) else { return nil }
         
         let pageRect = page.bounds(for: .mediaBox)
         let bounds = annotation.bounds
@@ -791,12 +824,14 @@ struct DocumentReviewView: View {
         var rotation: CGFloat = 0
         var color: SignatureColor = .black
         var aspectRatio: CGFloat = bounds.width > 0 ? bounds.width / bounds.height : 2.0
+        var widthRatio: CGFloat? = nil
         var image: UIImage?
         
         if let stamp = annotation as? ImageStampAnnotation {
             rotation = stamp.originalRotation
             color = stamp.originalColor
             aspectRatio = stamp.originalAspectRatio
+            widthRatio = stamp.originalWidthRatio
             image = stamp.imageSnapshot
         }
         
@@ -807,6 +842,7 @@ struct DocumentReviewView: View {
             if let rot = json["rotation"] as? Double { rotation = CGFloat(rot) }
             if let colorRaw = json["color"] as? String, let c = SignatureColor(rawValue: colorRaw) { color = c }
             if let ar = json["aspectRatio"] as? Double { aspectRatio = CGFloat(ar) }
+            if let wr = json["widthRatio"] as? Double { widthRatio = CGFloat(wr) }
             if let b64 = json["imageDataB64"] as? String, let imgData = Data(base64Encoded: b64) {
                 image = UIImage(data: imgData)
             }
@@ -822,23 +858,35 @@ struct DocumentReviewView: View {
         
         return SignaturePlacement(
             center: center,
-            widthRatio: bounds.width / pageRect.width,
+            // CRITICAL: Prefer persisted widthRatio to avoid "growing" due to padded/rotated bounds.
+            widthRatio: widthRatio ?? (bounds.width / pageRect.width),
             rotation: rotation,
             color: color,
             aspectRatio: aspectRatio,
             signatureImage: finalImage
-        )
+        )  // imageHash computed automatically in init
     }
     
     private func beginEditing(annotation: PDFAnnotation, pageIndex: Int) {
+        // ROOT FIX: Selection changes are NOT recorded in undo/redo (selection is UI state, not document state)
+        // Prevent unnecessary updates if the same annotation is tapped again
+        if activeAnnotation === annotation && activeAnnotationPageIndex == pageIndex {
+            return
+        }
+        
         // commit current editing overlay into the active annotation in memory (no disk)
         commitActiveEditInMemory()
         
         guard let pdfDocument = pdfDocument,
               let page = pdfDocument.page(at: pageIndex) else { return }
         
-        // Accept any annotation with userName "Signature", not just ImageStampAnnotation
-        guard annotation.userName == "Signature" else { return }
+        // Accept any annotation marked as signature (using persisted .name key)
+        guard isSignatureAnnotation(annotation) else { return }
+        
+        // If already editing this annotation, do nothing (prevents unnecessary updates)
+        if activeAnnotation === annotation && activeAnnotationPageIndex == pageIndex {
+            return
+        }
         
         // Create a placement from the annotation for editing
         guard let placement = placement(from: annotation, on: page) else { return }
@@ -856,15 +904,105 @@ struct DocumentReviewView: View {
         }
         
         // Set up for in-place editing with parsed placement - DO NOT add to signaturePlacements array
-        activeAnnotation = targetAnnotation
-        activeAnnotationPageIndex = pageIndex
+        setEditingAnnotation(targetAnnotation, pageIndex: pageIndex)
         editingPlacement = placement // Store separately, not in signaturePlacements
         isPlacingSignature = false
         hasPendingChanges = false // only mark dirty on actual edits
         registerSavedAnnotationUndoSnapshot(for: pageIndex, placement: placement)
         savedAnnotationRedoStack[pageIndex] = []
-        redoStack[pageIndex] = []
+        
+        // Force immediate UI update to show selection box (immediate edit mode)
         pdfViewInstance?.setNeedsDisplay()
+    }
+    
+    // ROOT FIX: Removed restoreSelection - selection is UI state, not in undo/redo
+    
+    // ROOT FIX: Centralize annotation visibility toggling to avoid races / double-rendering.
+    // - When editing a saved signature: hide the PDFKit annotation and render it via SwiftUI overlay.
+    // - When exiting edit mode: show the PDFKit annotation again.
+    private func setEditingAnnotation(_ newAnn: PDFAnnotation?, pageIndex: Int?) {
+        // Unhide previous
+        if let old = activeAnnotation {
+            old.shouldDisplay = true
+        }
+        
+        activeAnnotation = newAnn
+        activeAnnotationPageIndex = pageIndex
+        
+        // Hide new (during edit)
+        if let new = newAnn {
+            new.shouldDisplay = false
+        }
+        
+        pdfViewInstance?.setNeedsDisplay()
+    }
+    
+    // ROOT FIX: Single tap router - handles both selecting signatures and deselecting on empty tap
+    private func handleTap(locationInView: CGPoint) {
+        guard let pdfView = pdfViewInstance,
+              let pdfDoc = pdfDocument,
+              let page = pdfDoc.page(at: currentPageIndex) else { return }
+        
+        // 1) If tap hits a saved signature, select it (even if another is currently selected)
+        let signatureAnnotations = page.annotations.filter { isSignatureAnnotation($0) }
+        
+        // Find the top-most hit (PDFKit draws later annotations on top, so reverse scan)
+        if let hit = signatureAnnotations.reversed().first(where: { ann in
+            let viewRect = pdfView.convert(ann.bounds, from: page)
+            // Add some padding so it's easier to tap
+            return viewRect.insetBy(dx: -10, dy: -10).contains(locationInView)
+        }) {
+            // Switch selection cleanly:
+            // 1) Commit current edits
+            // 2) Unhide previous annotation (if any)
+            // 3) Begin editing the new annotation (which will hide it deterministically)
+            commitActiveEditInMemory()
+            setEditingAnnotation(nil, pageIndex: nil)
+            editingPlacement = nil
+            beginEditing(annotation: hit, pageIndex: currentPageIndex)
+            return
+        }
+        
+        // 2) Check if tap hits an unsaved overlay (SwiftUI placement)
+        if let unsavedPlacements = signaturePlacements[currentPageIndex], !unsavedPlacements.isEmpty {
+            let pageBounds = page.bounds(for: .mediaBox)
+            let currentScale = pdfView.scaleFactor
+            
+            // Find the top-most unsaved placement that was hit
+            if let hitPlacement = unsavedPlacements.reversed().first(where: { placement in
+                let pdfPoint = CGPoint(
+                    x: placement.center.x * pageBounds.width,
+                    y: placement.center.y * pageBounds.height
+                )
+                let screenPoint = pdfView.convert(pdfPoint, from: page)
+                let safeRatio = max(0.01, placement.aspectRatio)
+                let visualWidth = (pageBounds.width * placement.widthRatio) * currentScale
+                let visualHeight = visualWidth / safeRatio
+                
+                // Create a rect around the placement center with padding
+                let placementRect = CGRect(
+                    x: screenPoint.x - visualWidth / 2 - 10,
+                    y: screenPoint.y - visualHeight / 2 - 10,
+                    width: visualWidth + 20,
+                    height: visualHeight + 20
+                )
+                return placementRect.contains(locationInView)
+            }) {
+                // Select the unsaved placement
+                activePlacementID[currentPageIndex] = hitPlacement.id
+        isPlacingSignature = true
+                pdfView.setNeedsDisplay()
+                return
+            }
+        }
+        
+        // 3) Otherwise: empty tap = deselect
+        commitActiveEditInMemory()
+        setEditingAnnotation(nil, pageIndex: nil)
+        editingPlacement = nil
+        activePlacementID[currentPageIndex] = nil
+        isPlacingSignature = false
+        pdfView.setNeedsDisplay()
     }
     
     
@@ -930,6 +1068,11 @@ struct DocumentReviewView: View {
     // Commit all pages in memory (without writing to disk) - used for sharing
     private func commitAllPagesInMemory() {
         guard let pdfDoc = pdfDocument else { return }
+        
+        // CRITICAL FIX: Ensure active annotation is visible for export (prevents signatures disappearing on share)
+        if let ann = activeAnnotation {
+            ann.shouldDisplay = true
+        }
         
         // 1. Commit any active in-place edits first
         commitActiveEditInMemory()
@@ -1050,7 +1193,7 @@ struct DocumentReviewView: View {
         }
         
         var allPlacements: [SignaturePlacement] = []
-        for annotation in page.annotations where annotation.userName == "Signature" {
+        for annotation in page.annotations where isSignatureAnnotation(annotation) {
             if let p = placement(from: annotation, on: page) {
                 allPlacements.append(p)
             }
@@ -1086,7 +1229,7 @@ struct DocumentReviewView: View {
         guard let pdfDocument = pdfDocument else { return }
         
         // Get existing annotations to avoid duplicates
-        let existingAnnotations = page.annotations.filter { $0.userName == "Signature" }
+        let existingAnnotations = page.annotations.filter { isSignatureAnnotation($0) }
         
         // Add all placements as annotations (only new ones that don't already exist)
         for placement in placements {
@@ -1163,8 +1306,6 @@ struct DocumentReviewView: View {
     private func makeAnnotation(from placement: SignaturePlacement, on page: PDFPage) -> ImageStampAnnotation? {
         let pageRect = page.bounds(for: .mediaBox)
         
-        let finalImage = placement.color == .black ? placement.signatureImage : applyColorToSignature(placement.signatureImage, color: placement.color)
-        
         let pdfWidth = pageRect.width * placement.widthRatio
         let pdfHeight = pdfWidth / placement.aspectRatio
         
@@ -1188,11 +1329,15 @@ struct DocumentReviewView: View {
         
         let annotation = ImageStampAnnotation(
             bounds: signatureBounds,
-            image: finalImage,
+            // CRITICAL: Store the ORIGINAL image once; color is applied at draw-time from metadata.
+            image: placement.signatureImage,
             rotation: placement.rotation,
             color: placement.color,
-            aspectRatio: placement.aspectRatio
+            aspectRatio: placement.aspectRatio,
+            widthRatio: placement.widthRatio
         )
+        // ROOT FIX: Mark annotation with persisted name key (survives save/reload)
+        annotation.setValue(signatureAnnotationName, forAnnotationKey: .name)
         annotation.isLocked = true
         annotation.shouldPrint = true
         return annotation
@@ -1220,16 +1365,19 @@ struct DocumentReviewView: View {
         let clampedY = max(0, min(pdfY, pageRect.height - boundsHeight))
         let signatureBounds = CGRect(x: clampedX, y: clampedY, width: boundsWidth, height: boundsHeight)
         
-        // Apply color to signature image
-        let finalImage = placement.color == .black ? placement.signatureImage : applyColorToSignature(placement.signatureImage, color: placement.color)
-        
         // Mutate annotation in place (no remove/add) when possible
         if let stamp = annotation as? ImageStampAnnotation {
+            // Update bounds first (critical for rotation)
             stamp.bounds = signatureBounds
+            // Update rotation property (this is what ImageStampAnnotation.draw() uses)
             stamp.originalRotation = placement.rotation
             stamp.originalColor = placement.color
             stamp.originalAspectRatio = placement.aspectRatio
-            stamp.updateImage(finalImage) // This updates the image and triggers re-render
+            stamp.originalWidthRatio = placement.widthRatio
+            // CRITICAL: Do NOT regenerate tinted images here (that is what caused the runaway memory/CPU).
+            // Only update the stored image if it actually changed; tint is handled in draw(with:in:).
+            stamp.updateImageIfNeeded(placement.signatureImage)
+            // Force immediate redraw after rotation change
             return stamp
         } else {
             // Replace with our editable annotation so future edits stay in-place
@@ -1248,9 +1396,12 @@ struct DocumentReviewView: View {
         
         // Schedule refresh after a short delay (debounce) to avoid lag during drag
         // Use Task to ensure main actor execution
-        refreshTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: false) { _ in
+        // NOTE: DocumentReviewView is a struct, so we can't capture [weak self].
+        // Instead, weak-capture the PDFView (a class) to avoid retain cycles.
+        let pdfView = pdfViewInstance
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: false) { [weak pdfView] _ in
             Task { @MainActor in
-                self.pdfViewInstance?.setNeedsDisplay()
+                pdfView?.setNeedsDisplay()
             }
         }
     }
@@ -1300,9 +1451,9 @@ struct DocumentReviewView: View {
             stamp.originalRotation = placement.rotation
             stamp.originalColor = placement.color
             stamp.originalAspectRatio = placement.aspectRatio
-            // Update the actual ink image if the color changed
-            let finalImage = placement.color == .black ? placement.signatureImage : applyColorToSignature(placement.signatureImage, color: placement.color)
-            stamp.updateImage(finalImage)
+            stamp.originalWidthRatio = placement.widthRatio
+            // CRITICAL: Avoid regenerating tinted images. Keep original image, apply color at draw-time.
+            stamp.updateImageIfNeeded(placement.signatureImage)
         }
         
         // Tell the PDFView to redraw only the affected area (high performance)
@@ -1318,45 +1469,97 @@ struct DocumentReviewView: View {
         
         let placements = signaturePlacements[currentPageIndex] ?? []
         if placements.isEmpty {
-            appendNewPlacement()
+            addNewPlacement()
         }
     }
     
-    private func appendNewPlacement(using image: UIImage? = nil) {
-        let signatureImage = image ?? signatureService.signatureImage
-        // GUARD: Need the image AND the pdfViewInstance to do the math
-        guard let signatureImage, let pdfView = pdfViewInstance else { return }
+    // HARMONY MASTER FUNCTION: Single source of truth for all signature creation
+    // Handles both "New Insert" (parent: nil) and "Duplicate" (parent: existing placement)
+    private func addNewPlacement(image: UIImage? = nil, from parent: SignaturePlacement? = nil) {
+        // ROOT FIX: Clear any active saved signature editing when inserting a new signature
+        // This ensures the new signature is immediately visible
+        if let currentAnnotation = activeAnnotation {
+            commitActiveEditInMemory()
+            // Exit edit mode cleanly (ensures annotation visibility is restored)
+            setEditingAnnotation(nil, pageIndex: nil)
+            editingPlacement = nil
+        }
         
-        // 1. Get the screen center
-        let screenCenter = CGPoint(x: pdfView.bounds.midX, y: pdfView.bounds.midY)
+        let signatureImage = image ?? parent?.signatureImage ?? signatureService.signatureImage
+        guard let signatureImage else { return }
         
-        // 2. Convert that screen point to the actual PDF page coordinates
-        if let page = pdfView.currentPage {
-            let pdfPoint = pdfView.convert(screenCenter, to: page)
-            let pageBounds = page.bounds(for: .mediaBox)
-            
-            let normX = pdfPoint.x / pageBounds.width
-            let normY = pdfPoint.y / pageBounds.height
-            
-            let aspectRatio = signatureImage.size.height > 0 ? signatureImage.size.width / signatureImage.size.height : 2.0
-            
+        // If pdfViewInstance is nil, try to get it from the current view state
+        // Otherwise, place signature at center of current page
+        guard let pdfView = pdfViewInstance, let page = pdfView.currentPage else {
+            // Fallback: Add to signaturePlacements without immediate visual feedback
+            // This ensures the plus button works even if PDFView isn't ready
+        let aspectRatio = signatureImage.size.height > 0 ? signatureImage.size.width / signatureImage.size.height : 2.0
             let newPlacement = SignaturePlacement(
-                center: CGPoint(x: normX, y: normY),
-            widthRatio: 0.3,
-            rotation: 0,
-            color: .black,
+                center: CGPoint(x: 0.5, y: 0.5),  // Center of page
+                widthRatio: parent?.widthRatio ?? 0.195,
+                rotation: parent?.rotation ?? 0,
+                color: parent?.color ?? .black,
+                aspectRatio: aspectRatio,
+                signatureImage: signatureImage
+            )  // imageHash computed automatically in init
+        registerUndoSnapshot(for: currentPageIndex)
+            signaturePlacements[currentPageIndex, default: []].append(newPlacement)
+            activePlacementID[currentPageIndex] = newPlacement.id
+            redoStack[currentPageIndex] = []
+            hasPendingChanges = true
+            isPlacingSignature = true
+            zoomRefreshID = UUID()
+            return
+        }
+
+        let pageBounds = page.bounds(for: .mediaBox)
+        var finalCenter: CGPoint
+        
+        if let parent = parent {
+            // CASE: DUPLICATE (Apply smaller offset so they don't stack)
+            let offsetX = min(0.08, 1.0 - parent.center.x - parent.widthRatio/2 - 0.05)
+            let offsetY = min(0.08, parent.center.y - parent.widthRatio/parent.aspectRatio/2 - 0.05)
+            finalCenter = CGPoint(
+                x: min(0.95, parent.center.x + max(0.05, offsetX)),
+                y: max(0.05, parent.center.y - max(0.05, offsetY))
+            )
+        } else {
+            // CASE: NEW INSERT (Convert screen center to PDF coordinates)
+            let screenCenter = CGPoint(x: pdfView.bounds.midX, y: pdfView.bounds.midY)
+            let pdfPoint = pdfView.convert(screenCenter, to: page)
+            finalCenter = CGPoint(
+                x: pdfPoint.x / pageBounds.width,
+                y: pdfPoint.y / pageBounds.height
+            )
+        }
+
+        let aspectRatio = signatureImage.size.height > 0 ? signatureImage.size.width / signatureImage.size.height : 2.0
+        
+        let newPlacement = SignaturePlacement(
+            center: finalCenter,
+            widthRatio: parent?.widthRatio ?? 0.195,  // 65% of original 0.3
+            rotation: parent?.rotation ?? 0,
+            color: parent?.color ?? .black,
             aspectRatio: aspectRatio,
             signatureImage: signatureImage
-            )
-            
-            let pIndex = pdfDocument?.index(for: page) ?? currentPageIndex
-            registerUndoSnapshot(for: pIndex)
-            signaturePlacements[pIndex, default: []].append(newPlacement)
-            activePlacementID[pIndex] = newPlacement.id
-            redoStack[pIndex] = []
-        }
-        isPlacingSignature = true
+        )  // imageHash computed automatically in init
+        
+        let pIndex = pdfDocument?.index(for: page) ?? currentPageIndex
+        registerUndoSnapshot(for: pIndex)
+        signaturePlacements[pIndex, default: []].append(newPlacement)
+        activePlacementID[pIndex] = newPlacement.id
+        redoStack[pIndex] = []
         hasPendingChanges = true
+        isPlacingSignature = true
+        
+        // ROOT FIX: Force immediate UI refresh so signature appears instantly, not after save
+        zoomRefreshID = UUID()
+    }
+    
+    // DEPRECATED: Legacy wrapper - use addNewPlacement() directly
+    // Keeping for backward compatibility but should be removed
+    private func appendNewPlacement(using image: UIImage? = nil) {
+        addNewPlacement(image: image, from: nil)
     }
     
     private func registerUndoSnapshot(for pageIndex: Int) {
@@ -1386,6 +1589,10 @@ struct DocumentReviewView: View {
     }
     
     private func undoAction(for pageIndex: Int) {
+        // ROOT FIX: Selection changes are NOT in undo/redo (selection is UI state, not document state)
+        // Undo/redo only handles actual edits: move/resize/rotate/delete/add
+        
+        // Check for annotation edits
         if let annotation = activeAnnotation,
            let placement = editingPlacement,
            let pdfDocument = pdfDocument,
@@ -1401,14 +1608,20 @@ struct DocumentReviewView: View {
             return
         }
         
+        // Finally check for unsaved signature changes
         guard var stack = undoStack[pageIndex], let previous = stack.popLast() else { return }
         let current = signaturePlacements[pageIndex] ?? []
         undoStack[pageIndex] = stack
         redoStack[pageIndex, default: []].append(current)
         applySnapshot(for: pageIndex, placements: previous)
+        hasPendingChanges = true
     }
     
     private func redoAction(for pageIndex: Int) {
+        // ROOT FIX: Selection changes are NOT in undo/redo (selection is UI state, not document state)
+        // Undo/redo only handles actual edits: move/resize/rotate/delete/add
+        
+        // Check for annotation edits
         if let annotation = activeAnnotation,
            let placement = editingPlacement,
            let pdfDocument = pdfDocument,
@@ -1424,39 +1637,17 @@ struct DocumentReviewView: View {
             return
         }
         
+        // Finally check for unsaved signature changes
         guard var stack = redoStack[pageIndex], let next = stack.popLast() else { return }
         let current = signaturePlacements[pageIndex] ?? []
         redoStack[pageIndex] = stack
         undoStack[pageIndex, default: []].append(current)
         applySnapshot(for: pageIndex, placements: next)
+        hasPendingChanges = true
     }
     
-    private func applyColorToSignature(_ image: UIImage, color: SignatureColor) -> UIImage {
-        let rect = CGRect(origin: .zero, size: image.size)
-        let renderer = UIGraphicsImageRenderer(size: image.size)
-        
-        return renderer.image { context in
-            // Draw the original signature (preserves transparency)
-            image.draw(in: rect)
-            
-            // Use 'sourceIn' blend mode to only color non-transparent pixels (the ink)
-            context.cgContext.setBlendMode(.sourceIn)
-            context.cgContext.setFillColor(color.uiColor.cgColor)
-            context.cgContext.fill(rect)
-        }
-    }
-    
-    private func flipImageVertically(_ image: UIImage) -> UIImage? {
-        guard let cgImage = image.cgImage else { return nil }
-        let size = image.size
-        let renderer = UIGraphicsImageRenderer(size: size)
-        return renderer.image { context in
-            let cgContext = context.cgContext
-            cgContext.translateBy(x: 0, y: size.height)
-            cgContext.scaleBy(x: 1.0, y: -1.0)
-            cgContext.draw(cgImage, in: CGRect(origin: .zero, size: size))
-        }
-    }
+    // NOTE: Color is now applied at render-time (SwiftUI template tint + PDFAnnotation draw-time tint).
+    // Keeping this removed helper out prevents accidental reintroduction of heavy image regeneration.
     
     // MARK: - Share Sheet
     private struct ActivityView: UIViewControllerRepresentable {
@@ -1474,49 +1665,6 @@ struct DocumentReviewView: View {
 extension Collection {
     subscript(safe index: Index) -> Element? {
         indices.contains(index) ? self[index] : nil
-    }
-}
-
-// MARK: - Inline Signature Overlay Component
-struct InlineSignatureOverlay: View {
-    let pageIndex: Int
-    let pdfDocument: PDFDocument
-    let signatureImage: UIImage
-    @Binding var placement: DocumentReviewView.SignaturePlacement
-    let isActive: Bool
-    let onSave: () -> Void
-    let onDelete: () -> Void
-    let onDuplicate: (DocumentReviewView.SignaturePlacement) -> Void
-    let onGestureStart: () -> Void
-    
-    @State private var isSelected = true
-    @State private var showColorPicker = false
-    @State private var isMoveMode = false
-    @State private var tempPosition: CGPoint? = nil
-    @State private var tempWidthRatio: CGFloat? = nil
-    @State private var tempRotation: CGFloat? = nil
-    @State private var initialWidthRatio: CGFloat? = nil
-    @State private var initialRotation: CGFloat? = nil
-    
-    var body: some View {
-        // DEPRECATED: InlineSignatureOverlay is no longer used - replaced by UnifiedSignatureOverlay
-        // This struct is kept for reference but should not be called
-        EmptyView()
-    }
-    
-    private func applyColor(_ image: UIImage, color: SignatureColor) -> UIImage {
-        let rect = CGRect(origin: .zero, size: image.size)
-        let renderer = UIGraphicsImageRenderer(size: image.size)
-        
-        return renderer.image { context in
-            // Draw the original signature (preserves transparency)
-            image.draw(in: rect)
-            
-            // Use 'sourceIn' blend mode to only color non-transparent pixels (the ink)
-            context.cgContext.setBlendMode(.sourceIn)
-            context.cgContext.setFillColor(color.uiColor.cgColor)
-            context.cgContext.fill(rect)
-        }
     }
 }
 
@@ -1557,7 +1705,7 @@ struct FloatingToolbarViewInline: View {
                             guard let pdfView = pdfView, let page = page else { return }
                             
                             if !isMoveMode {
-                                isMoveMode = true
+                            isMoveMode = true
                                 onMoveStart()
                                 
                                 // CALCULATE OFFSET: How far is the finger from the signature center?
@@ -1630,13 +1778,27 @@ struct SavedSignatureOverlay: View {
     let onDelete: (PDFAnnotation) -> Void
     let onEdit: (PDFAnnotation) -> Void
     
+    // ROOT FIX: Use persisted .name key + contents marker to identify signatures
+    private func isSignature(_ ann: PDFAnnotation) -> Bool {
+        // 1) Strongest persisted marker: /NM (PDFAnnotationKey.name)
+        if let name = ann.value(forAnnotationKey: .name) as? String,
+           name == "JustScanSignature_v1" {
+            return true
+        }
+        // 2) Fallback: our JSON marker in /Contents
+        if let contents = ann.contents, contents.contains("\"imageDataB64\"") {
+            return true
+        }
+        return false
+    }
+    
     var body: some View {
         GeometryReader { _ in
             if let page = pdfDocument.page(at: pageIndex),
                let pdfView = pdfViewInstance,
                pdfView.scaleFactor > 0 {
                 let signatureAnnotations = page.annotations.filter {
-                    $0.userName == "Signature" && $0 !== currentlyEditingAnnotation
+                    isSignature($0) && $0 !== currentlyEditingAnnotation
                 }
                 let annotatedItems = signatureAnnotations.map { (ObjectIdentifier($0), $0) }
                 
@@ -1676,514 +1838,203 @@ struct UnifiedSignatureOverlay: View {
     let pdfView: PDFView
     @Binding var placement: DocumentReviewView.SignaturePlacement
     let isActive: Bool
-    let activeAnnotation: PDFAnnotation?  // Reference to the PDF annotation for lifecycle hooks
+    let activeAnnotation: PDFAnnotation?
     let onDelete: () -> Void
     let onGestureStart: () -> Void
     let onDuplicate: () -> Void
-    let onDragStart: (() -> Void)? // Used to hide real annotation
-    let onDragEnd: (() -> Void)?   // Used to show real annotation
+    let onDragStart: (() -> Void)?
+    let onDragEnd: (() -> Void)?
+    let onRotationChange: (() -> Void)?  // Callback for rotation changes to update bounds
+    let onSelectInactive: (() -> Void)?  // Tap-to-select for inactive overlays (unsaved duplicates)
 
     @State private var ghostPosition: CGPoint? = nil
     @State private var initialWidthRatio: CGFloat? = nil
     @State private var initialRotation: CGFloat? = nil
-    @State private var rotationCenter: CGPoint? = nil  // Lock center during rotation to prevent bouncing
+    @State private var rotationCenter: CGPoint? = nil
     @State private var showColorPicker = false
-    @State private var isMoveMode = false  // State for move mode
-    @State private var hasStartedGesture = false  // Prevent onGestureStart from running multiple times per touch
-
+    @State private var isMoveMode = false
+    @State private var hasStartedGesture = false
+    
+    // ROOT FIX: Use @ViewBuilder to allow complex logic without manual 'return' statements
+    @ViewBuilder
     var body: some View {
-        // 1. Ensure the PDF engine is actually ready
-        if let page = pdfDocument.page(at: pageIndex),
-           pdfView.scaleFactor > 0.1 {
-            
+        if let page = pdfDocument.page(at: pageIndex), pdfView.scaleFactor > 0.1 {
             let pageBounds = page.bounds(for: .mediaBox)
             let currentScale = pdfView.scaleFactor
-            
-            // 2. Determine center (use ghost if dragging)
             let effectiveCenter = ghostPosition ?? placement.center
             let pdfPoint = CGPoint(
                 x: effectiveCenter.x * pageBounds.width,
                 y: effectiveCenter.y * pageBounds.height
             )
-            
-            // 3. Convert to Screen (This is the "Magic" fix for zoom)
             let screenPoint = pdfView.convert(pdfPoint, from: page)
-            
-            // 4. Guard against (0,0) snapping
-            if screenPoint != .zero {
+
+            // Safety guard for invalid coordinates
+            if screenPoint.x.isFinite && screenPoint.y.isFinite && screenPoint != .zero {
+                let safeRatio = max(0.01, placement.aspectRatio)
                 let visualWidth = (pageBounds.width * placement.widthRatio) * currentScale
-                let visualHeight = visualWidth / placement.aspectRatio
-                
-                ZStack {
-                    // 1. ALWAYS SHOW IMAGE (Tints based on color selection)
-                    let coloredImage = placement.color == .black ? placement.signatureImage : applyColorToImage(placement.signatureImage, color: placement.color)
-                    
-                    Image(uiImage: coloredImage)
-                        .resizable()
-                        .frame(width: visualWidth, height: visualHeight)
-                        .rotationEffect(.degrees(placement.rotation))
-                        .position(screenPoint)
-                        .opacity(ghostPosition != nil ? 0.0 : 1.0)  // Hide when ghost moves
-                        .allowsHitTesting(false)  // ROOT FIX: Touch falls through to box gesture
+                let visualHeight = visualWidth / safeRatio
 
-                    // 2. GHOST IMAGE (Smooth moving layer)
-                    if let ghostPos = ghostPosition {
-                        let ghostPdfPoint = CGPoint(
-                            x: ghostPos.x * pageBounds.width,
-                            y: ghostPos.y * pageBounds.height
-                        )
-                        let ghostScreenPoint = pdfView.convert(ghostPdfPoint, from: page)
-                        
-                        Image(uiImage: coloredImage)
-                            .resizable()
-                            .opacity(0.6)
-                            .frame(width: visualWidth, height: visualHeight)
-                            .rotationEffect(.degrees(placement.rotation))
-                            .position(ghostScreenPoint)
-                    }
-
-                    // 3. INTERACTIVE LAYER (Only if active)
-                    if isActive {
-                        InlineSelectionBoxView(
-                            position: screenPoint,
-                            size: CGSize(width: visualWidth, height: visualHeight),
-                            rotation: placement.rotation,
-                            scaleFactor: currentScale,
-                            onMove: { _ in }, 
-                            onResize: { factor in
-                                if initialWidthRatio == nil { initialWidthRatio = placement.widthRatio }
-                                let newWidthRatio = max(0.05, min(0.8, initialWidthRatio! * factor))
-                                var updated = placement
-                                updated.widthRatio = newWidthRatio
-                                placement = updated
-                            },
-                            onResizeEnd: { 
-                                initialWidthRatio = nil
-                                pdfView.setNeedsDisplay()
-                            },
-                            onRotate: { angle in
-                                if initialRotation == nil { 
-                                    initialRotation = placement.rotation
-                                    rotationCenter = placement.center  // Lock center at start
-                                    onGestureStart()
-                                }
-                                let newRotation = (initialRotation! + angle).truncatingRemainder(dividingBy: 360)
-                                var updated = placement
-                                updated.rotation = newRotation < 0 ? newRotation + 360 : newRotation
-                                updated.center = rotationCenter ?? placement.center  // Keep center locked
-                                placement = updated
-                            },
-                            onRotateEnd: { 
-                                initialRotation = nil
-                                rotationCenter = nil  // Release center lock
-                                pdfView.setNeedsDisplay()
-                            },
-                            onGestureStart: onGestureStart
-                        )
-                        .gesture(
-                            DragGesture(minimumDistance: 0)
-                                .onChanged { value in
-                                    if !hasStartedGesture {
-                                        onGestureStart()  // Only runs once per touch!
-                                        onDragStart?()  // Hide real annotation
-                                        hasStartedGesture = true
-                                    }
-                                    
-                                    let loc = pdfView.convert(value.location, to: page)
-                                    
-                                    // CALCULATE BOUNDS CLAMPING - Keep signature fully on paper
-                                    let halfWidthRatio = placement.widthRatio / 2
-                                    let halfHeightRatio = (placement.widthRatio / placement.aspectRatio) / 2
-                                    
-                                    let normX = max(halfWidthRatio, min(1.0 - halfWidthRatio, loc.x / pageBounds.width))
-                                    let normY = max(halfHeightRatio, min(1.0 - halfHeightRatio, loc.y / pageBounds.height))
-                                    
-                                    self.ghostPosition = CGPoint(x: normX, y: normY)
-                                    
-                                    // Update placement in real-time for unsaved signatures
-                                    if onDragStart == nil {
-                                        var updated = placement
-                                        updated.center = CGPoint(x: normX, y: normY)
-                                        placement = updated
-                                    }
-                                }
-                                .onEnded { _ in
-                                    if let final = ghostPosition {
-                                        var updated = placement
-                                        updated.center = final
-                                        placement = updated
-                                    }
-                                    ghostPosition = nil
-                                    hasStartedGesture = false  // Reset for next touch
-                                    onDragEnd?()  // Show real annotation
-                                    pdfView.setNeedsDisplay()
-                                }
-                        )
-                        
-                        // Floating toolbar with clipping safety check
-                        FloatingToolbarViewInline(
-                            position: CGPoint(
-                                x: screenPoint.x,
-                                // IF signature is too high (y < 100), put toolbar BELOW (+ visualHeight/2 + 60)
-                                y: screenPoint.y < 100 ? screenPoint.y + visualHeight/2 + 60 : screenPoint.y - visualHeight/2 - 60
-                            ),
-                            offsetX: 0,
-                            offsetY: 0,
-                            displayWidth: pageBounds.width * currentScale,
-                            displayHeight: pageBounds.height * currentScale,
-                            pdfView: pdfView,
-                            page: page,
-                            onColor: { showColorPicker = true },
-                            onDelete: onDelete,
-                            onDuplicate: onDuplicate,
-                            onMoveStart: { onGestureStart() },
-                            onMoveChanged: { newPos in
-                                self.ghostPosition = newPos
-                                // Update placement in real-time for unsaved signatures
-                                if onDragStart == nil {
-                                    var updated = placement
-                                    updated.center = newPos
-                                    placement = updated
-                                }
-                            },
-                            onMoveEnded: {
-                                if let final = ghostPosition { 
-                                    var updated = placement
-                                    updated.center = final
-                                    placement = updated
-                                }
-                                ghostPosition = nil
-                                pdfView.setNeedsDisplay()
-                            },
-                            isMoveMode: $isMoveMode,
-                            currentPosition: effectiveCenter,
-                            currentWidthRatio: placement.widthRatio,
-                            currentAspectRatio: placement.aspectRatio
-                        )
-                    }
-                }
-                .confirmationDialog("Signature Color", isPresented: $showColorPicker) {
-                    ForEach(SignatureColor.allCases, id: \.self) { color in
-                        Button(color.rawValue) {
-                            var updated = placement
-                            updated.color = color
-                            placement = updated
-                            
-                            // For saved annotations, immediately apply to PDF
-                            if onDragStart != nil {
-                                // This is a saved annotation - trigger parent to update PDF
-                                pdfView.setNeedsDisplay()
-                            } else {
-                                // This is an unsaved signature - just refresh
-                                pdfView.setNeedsDisplay()
-                            }
-                        }
-                    }
-                    Button("Cancel", role: .cancel) {}
-                }
-                .onAppear {
-                    // Hide real ink when sticker appears
-                    if let annotation = activeAnnotation {
-                        annotation.shouldDisplay = false
-                        pdfView.setNeedsDisplay()
-                    }
-                }
-                .onDisappear {
-                    // Reveal real ink when sticker dies
-                    if let annotation = activeAnnotation {
-                        annotation.shouldDisplay = true
-                        pdfView.setNeedsDisplay()
-                    }
-                }
+                contentStack(screenPoint: screenPoint, visualWidth: visualWidth, visualHeight: visualHeight, page: page, pageBounds: pageBounds)
             }
         }
     }
-    
-    // Helper function to apply color to signature image
-    private func applyColorToImage(_ image: UIImage, color: SignatureColor) -> UIImage {
-        let rect = CGRect(origin: .zero, size: image.size)
-        let renderer = UIGraphicsImageRenderer(size: image.size)
-        
-        return renderer.image { context in
-            image.draw(in: rect)
-            context.cgContext.setBlendMode(.sourceIn)
-            context.cgContext.setFillColor(color.uiColor.cgColor)
-            context.cgContext.fill(rect)
+
+    @ViewBuilder
+    private func contentStack(screenPoint: CGPoint, visualWidth: CGFloat, visualHeight: CGFloat, page: PDFPage, pageBounds: CGRect) -> some View {
+                ZStack {
+            // 1. Signature Image
+            signatureImageLayer(visualWidth: visualWidth, visualHeight: visualHeight, screenPoint: screenPoint)
+            
+            // 2. Ghost Layer during drag
+            if let ghostPos = ghostPosition {
+                ghostImageLayer(ghostPos: ghostPos, pageBounds: pageBounds, visualWidth: visualWidth, visualHeight: visualHeight)
+            }
+
+            // 3. Interactive Handles and Toolbar
+            if isActive {
+                interactiveLayer(screenPoint: screenPoint, visualWidth: visualWidth, visualHeight: visualHeight, page: page, pageBounds: pageBounds)
+            } else {
+                // Inactive overlays were not selectable because the image layer disables hit-testing.
+                // Provide an explicit hit target so taps can switch selection between unsaved duplicates.
+                Color.clear
+                    .frame(width: visualWidth + 24, height: visualHeight + 24)
+                    .rotationEffect(.degrees(rotation))
+                    .position(screenPoint)
+                    .contentShape(Rectangle())
+                    .onTapGesture { onSelectInactive?() }
+            }
         }
     }
-}
 
-// MARK: - Saved Signature Selection Overlay (handles only, no image) - DEPRECATED
-struct SavedSignatureSelectionOverlay: View {
-    let pageIndex: Int
-    let pdfDocument: PDFDocument
-    let pdfViewInstance: PDFView?  // PDFView instance for coordinate conversion
-    @Binding var placement: DocumentReviewView.SignaturePlacement
-    let onDelete: () -> Void
-    let onGestureStart: () -> Void
-    let onRefreshNeeded: () -> Void
-    let onDuplicate: () -> Void
-    let onDragStart: (() -> Void)?  // Optional callback to hide annotation
-    let onDragEnd: (() -> Void)?    // Optional callback to show annotation
-    
-    @State private var isSelected = true
-    @State private var showColorPicker = false
-    @State private var tempPosition: CGPoint? = nil
-    @State private var tempWidthRatio: CGFloat? = nil
-    @State private var tempRotation: CGFloat? = nil
-    @State private var initialWidthRatio: CGFloat? = nil
-    @State private var initialRotation: CGFloat? = nil
-    @State private var isMoveMode = false
-    @State private var dragStartCenter: CGPoint? = nil
-    @State private var ghostPosition: CGPoint? = nil  // Ghost position for smooth drag
-    @State private var isDragging = false  // Track drag state
-    
-    var body: some View {
-        GeometryReader { _ in
-            // Ensure engine is ready and zoom is valid (>0) to prevent snapping to (0,0)
-            if let page = pdfDocument.page(at: pageIndex),
-               let pdfView = pdfViewInstance,
-               pdfView.scaleFactor > 0 {
-                
-                let pageBounds = page.bounds(for: .mediaBox)
-                
-                // GUARD: Ensure the page and view actually have size to avoid snapping to (0,0)
-                guard pageBounds.width > 0, pdfView.frame.width > 0 else {
-                    return AnyView(EmptyView())
-                }
-                
-                let currentScale = pdfView.scaleFactor
-                let effectiveCenter = ghostPosition ?? (tempPosition ?? placement.center)
-                let effectiveWidthRatio = tempWidthRatio ?? placement.widthRatio
-                let effectiveRotation = tempRotation ?? placement.rotation
-                
-                // 1. Calculate PDF points (Bottom-Left origin)
-                let pdfPoint = CGPoint(
-                    x: effectiveCenter.x * pageBounds.width,
-                    y: effectiveCenter.y * pageBounds.height
-                )
-                
-                // 2. NATIVE CONVERSION: Maps PDF data points to Screen Pixels
-                let screenPoint = pdfView.convert(pdfPoint, from: page)
-                
-                // 3. SCALE SIZE: Scales the box visual width by the zoom factor
-                let visualWidth = (pageBounds.width * effectiveWidthRatio) * currentScale
-                let visualHeight = visualWidth / placement.aspectRatio
-                
-                // Only draw if the engine returned a valid screen coordinate
-                guard screenPoint.x.isFinite && screenPoint.y.isFinite,
-                      screenPoint.x >= -10000 && screenPoint.x <= 10000,
-                      screenPoint.y >= -10000 && screenPoint.y <= 10000,
-                      screenPoint != .zero else {
-                    return AnyView(EmptyView())
-                }
-                
-                return AnyView(
-                ZStack {
-                    // GHOST IMAGE: Only visible during drag for smooth movement
-                    if ghostPosition != nil {
-                        // Use the same conversion logic as the selection box
-                        let ghostPdfPoint = CGPoint(
-                            x: ghostPosition!.x * pageBounds.width,
-                            y: ghostPosition!.y * pageBounds.height
-                        )
-                        let ghostScreenPoint = pdfView.convert(ghostPdfPoint, from: page)
-                        let ghostVisualWidth = (pageBounds.width * placement.widthRatio) * currentScale
-                        let ghostVisualHeight = ghostVisualWidth / placement.aspectRatio
-                        
-                        // Apply color to ghost image
-                        let coloredImage = placement.color == .black ? placement.signatureImage : applyColorToImage(placement.signatureImage, color: placement.color)
-                        
-                        Image(uiImage: coloredImage)
-                            .resizable()
-                            .aspectRatio(contentMode: .fit)
-                            .frame(width: ghostVisualWidth, height: ghostVisualHeight)
-                            .rotationEffect(.degrees(effectiveRotation))
-                            .opacity(0.6)  // Slightly transparent to show it's "ghost"
-                            .position(ghostScreenPoint)
-                    }
-                    
-                    // No image overlay - annotation is drawn by PDFKit
-                    // Only show selection box and handles
-                    
-                    if isSelected {
-                        // SELECTION BOX: Now pinned exactly to screenPoint using native conversion
+    // --- SUB-VIEWS TO PREVENT COMPILER TIMEOUT ---
+
+    private func signatureImageLayer(visualWidth: CGFloat, visualHeight: CGFloat, screenPoint: CGPoint) -> some View {
+        // CRITICAL: Avoid regenerating tinted UIImages during editing (causes CPU/memory spikes).
+        // Use template tint for non-black.
+        Group {
+            if placement.color == .black {
+                Image(uiImage: placement.signatureImage)
+                    .resizable()
+            } else {
+                Image(uiImage: placement.signatureImage)
+                    .renderingMode(.template)
+                    .resizable()
+                    .foregroundColor(Color(placement.color.uiColor))
+            }
+        }
+        .frame(width: visualWidth, height: visualHeight)
+        .rotationEffect(.degrees(placement.rotation))
+        .position(screenPoint)
+        .opacity(ghostPosition != nil ? 0.0 : 1.0)
+        .allowsHitTesting(false)
+    }
+
+    private func ghostImageLayer(ghostPos: CGPoint, pageBounds: CGRect, visualWidth: CGFloat, visualHeight: CGFloat) -> some View {
+        let ghostPdfPoint = CGPoint(x: ghostPos.x * pageBounds.width, y: ghostPos.y * pageBounds.height)
+        guard let ghostPage = pdfDocument.page(at: pageIndex) ?? pdfDocument.page(at: 0) else {
+            return AnyView(EmptyView())
+        }
+        let ghostScreenPoint = pdfView.convert(ghostPdfPoint, from: ghostPage)
+
+        // CRITICAL: Avoid regenerating tinted UIImages during drag; template tint instead.
+        return AnyView(
+        Group {
+            if placement.color == .black {
+                Image(uiImage: placement.signatureImage)
+                    .resizable()
+            } else {
+                Image(uiImage: placement.signatureImage)
+                    .renderingMode(.template)
+                    .resizable()
+                    .foregroundColor(Color(placement.color.uiColor))
+            }
+        }
+        .opacity(0.6)
+        .frame(width: visualWidth, height: visualHeight)
+        .rotationEffect(.degrees(placement.rotation))
+        .position(ghostScreenPoint)
+        )
+    }
+
+    @ViewBuilder
+    private func interactiveLayer(screenPoint: CGPoint, visualWidth: CGFloat, visualHeight: CGFloat, page: PDFPage, pageBounds: CGRect) -> some View {
                         InlineSelectionBoxView(
-                            position: screenPoint,
-                            size: CGSize(width: visualWidth, height: visualHeight),
-                            rotation: effectiveRotation,
-                            scaleFactor: currentScale,
+            position: screenPoint,
+            size: CGSize(width: visualWidth, height: visualHeight),
+            rotation: placement.rotation,
+            scaleFactor: pdfView.scaleFactor,
                             onMove: { _ in },
-                            onResize: { scaleFactor in
-                                if initialWidthRatio == nil {
-                                    initialWidthRatio = placement.widthRatio
-                                }
-                                let base = initialWidthRatio ?? placement.widthRatio
-                                let newWidthRatio = max(0.05, min(0.8, base * scaleFactor))
-                                tempWidthRatio = newWidthRatio
-                                
-                                // Update placement immediately so PDF annotation resizes in real-time
-                                var updated = placement
-                                updated.widthRatio = newWidthRatio
-                                placement = updated  // This triggers the binding setter
-                            },
-                            onResizeEnd: {
-                                if let final = tempWidthRatio {
-                                    placement.widthRatio = final
-                                }
-                                tempWidthRatio = nil
-                                initialWidthRatio = nil
-                                onRefreshNeeded()
-                            },
+            onResize: { factor in
+                let baseRatio = initialWidthRatio ?? placement.widthRatio
+                if initialWidthRatio == nil { initialWidthRatio = baseRatio }
+                placement.widthRatio = max(0.05, min(0.8, baseRatio * factor))
+            },
+            onResizeEnd: { initialWidthRatio = nil; pdfView.setNeedsDisplay() },
                             onRotate: { angle in
                                 if initialRotation == nil {
-                                    initialRotation = effectiveRotation
-                                    onGestureStart()
-                                }
-                                let baseRotation = initialRotation ?? effectiveRotation
-                                var newRotation = baseRotation + angle
-                                newRotation = newRotation.truncatingRemainder(dividingBy: 360)
-                                if newRotation < 0 { newRotation += 360 }
-                                tempRotation = newRotation
-                                
-                                // Update placement immediately so PDF annotation rotates in real-time
-                                var updated = placement
-                                updated.rotation = newRotation
-                                placement = updated  // This triggers the binding setter
+                    initialRotation = placement.rotation
+                    rotationCenter = placement.center
+                    onGestureStart()
+                }
+                let newRotation = (initialRotation! + angle).truncatingRemainder(dividingBy: 360)
+                let finalRotation = newRotation < 0 ? newRotation + 360 : newRotation
+                // Update placement to trigger binding setter
+                var updated = placement
+                updated.rotation = finalRotation
+                updated.center = rotationCenter ?? placement.center
+                placement = updated
+                // Force immediate update of annotation bounds when rotating (bypasses throttling)
+                onRotationChange?()
                             },
                             onRotateEnd: {
-                                if let final = tempRotation {
-                                    placement.rotation = final
-                                }
-                                tempRotation = nil
                                 initialRotation = nil
-                                onRefreshNeeded()
-                            },
-                            onGestureStart: { onGestureStart() }
-                        )
-                        .gesture(
-                            DragGesture(minimumDistance: 0)
-                                .onChanged { value in
-                                    // Start drag
-                                    if ghostPosition == nil {
-                                        onGestureStart()
-                                        dragStartCenter = placement.center
-                                        isDragging = true
-                                        // Tell parent to hide the real annotation
-                                        onDragStart?()
-                                    }
-                                    
-                                    // Convert the "Screen" touch to "PDF Page" points
-                                    // This handles ALL offsets, scales, and rotations for you
-                                    let locationInPage = pdfView.convert(value.location, to: page)
-                                    
-                                    // Normalize based on actual Page Bounds (not geometry.size)
-                                    let normX = locationInPage.x / pageBounds.width
-                                    let normY = locationInPage.y / pageBounds.height
-                                    
-                                    // Clamp to bounds
-                                    let normalizedHeight = placement.widthRatio / placement.aspectRatio
-                                    let newCenter = CGPoint(
-                                        x: max(placement.widthRatio / 2, min(1.0 - placement.widthRatio / 2, normX)),
-                                        y: max(normalizedHeight / 2, min(1.0 - normalizedHeight / 2, normY))
-                                    )
-                                    
-                                    // ONLY update ghost - NO PDF refresh here!
-                                    ghostPosition = newCenter
-                                }
-                                .onEnded { _ in
-                                    // Commit to real placement
-                                    if let finalPos = ghostPosition {
-                                        var updated = placement
-                                        updated.center = finalPos
-                                        placement = updated  // This triggers binding setter ONCE
-                                    }
-                                    ghostPosition = nil
-                                    dragStartCenter = nil
-                                    isDragging = false
-                                    onDragEnd?()  // Tell parent to show annotation again
-                                    // Instead of refreshing the whole PDFView, just tell it to redraw
-                                    pdfViewInstance?.setNeedsDisplay()
-                                }
-                        )
-                        
-                        // Floating toolbar positioned above the selection box
-                        FloatingToolbarViewInline(
-                            position: CGPoint(
-                                x: screenPoint.x,
-                                // IF signature is too high (y < 100), put toolbar BELOW (+ visualHeight/2 + 60)
-                                y: screenPoint.y < 100 ? screenPoint.y + visualHeight/2 + 60 : screenPoint.y - visualHeight/2 - 60
-                            ),
-                            offsetX: 0,  // Not needed with native conversion
-                            offsetY: 0,  // Not needed with native conversion
-                            displayWidth: pageBounds.width * currentScale,
-                            displayHeight: pageBounds.height * currentScale,
-                            pdfView: pdfView,
-                            page: page,
-                            onColor: { showColorPicker = true },
-                            onDelete: onDelete,
-                            onDuplicate: onDuplicate,
-                            onMoveStart: { onGestureStart() },
-                            onMoveChanged: { newPos in
-                                tempPosition = newPos
-                                
-                                // Update placement immediately so PDF annotation moves in real-time
-                                var updated = placement
-                                updated.center = newPos
-                                placement = updated  // This triggers the binding setter
-                            },
-                            onMoveEnded: {
-                                if let finalPos = tempPosition {
-                                    placement.center = finalPos
-                                }
-                                tempPosition = nil
-                                // Force immediate PDF refresh on gesture end
-                                onRefreshNeeded()
-                            },
-                            isMoveMode: $isMoveMode,
-                            currentPosition: effectiveCenter,
-                            currentWidthRatio: effectiveWidthRatio,
-                            currentAspectRatio: placement.aspectRatio
-                        )
+                rotationCenter = nil
+                // Final commit to ensure rotation is saved
+                onRotationChange?()
+                pdfView.setNeedsDisplay()
+            },
+            onGestureStart: onGestureStart
+        )
+        .contentShape(Rectangle())  // ROOT FIX: Makes entire box area draggable, not just border
+        .gesture(
+            DragGesture(minimumDistance: 10)  // ROOT FIX: Require 10pt movement before drag starts (prevents tap from moving signature)
+                .onChanged { value in
+                    if !hasStartedGesture {
+                        onGestureStart(); onDragStart?(); hasStartedGesture = true
                     }
+                    let loc = pdfView.convert(value.location, to: page)
+                    let halfW = placement.widthRatio / 2
+                    let halfH = (placement.widthRatio / max(0.1, placement.aspectRatio)) / 2
+                    self.ghostPosition = CGPoint(
+                        x: max(halfW, min(1.0 - halfW, loc.x / pageBounds.width)),
+                        y: max(halfH, min(1.0 - halfH, loc.y / pageBounds.height))
+                    )
                 }
-                .confirmationDialog("Signature Color", isPresented: $showColorPicker) {
+                .onEnded { _ in
+                    if let final = ghostPosition { placement.center = final }
+                    ghostPosition = nil; hasStartedGesture = false; onDragEnd?(); pdfView.setNeedsDisplay()
+                }
+        )
+        
+        FloatingToolbarViewInline(
+            position: CGPoint(x: screenPoint.x, y: screenPoint.y < 100 ? screenPoint.y + visualHeight/2 + 60 : screenPoint.y - visualHeight/2 - 60),
+            offsetX: 0, offsetY: 0, displayWidth: pageBounds.width * pdfView.scaleFactor, displayHeight: pageBounds.height * pdfView.scaleFactor, pdfView: pdfView, page: page,
+            onColor: { showColorPicker = true }, onDelete: onDelete, onDuplicate: onDuplicate,
+            onMoveStart: { onGestureStart() },
+            onMoveChanged: { newPos in self.ghostPosition = newPos; placement.center = newPos },
+            onMoveEnded: { ghostPosition = nil; pdfView.setNeedsDisplay() },
+            isMoveMode: $isMoveMode, currentPosition: ghostPosition ?? placement.center,
+            currentWidthRatio: placement.widthRatio, currentAspectRatio: placement.aspectRatio
+        )
+        .confirmationDialog("Color", isPresented: $showColorPicker) {
                     ForEach(SignatureColor.allCases, id: \.self) { color in
-                        Button(color.rawValue) {
-                            // Force update by creating a new placement struct to trigger binding setter
-                            var updated = placement
-                            updated.color = color
-                            placement = updated
-                            // Force immediate PDF refresh for color change (don't throttle)
-                            onRefreshNeeded()
-                        }
-                    }
-                    Button("Cancel", role: .cancel) {}
-                }
-                )
-            } else {
-                // PDFView not ready, show nothing
-                return AnyView(EmptyView())
+                Button(color.rawValue) { placement.color = color; pdfView.setNeedsDisplay() }
             }
         }
-        .allowsHitTesting(true)
     }
-    
-    // Helper function to apply color to signature image (same logic as DocumentReviewView.applyColorToSignature)
-    private func applyColorToImage(_ image: UIImage, color: SignatureColor) -> UIImage {
-        let rect = CGRect(origin: .zero, size: image.size)
-        let renderer = UIGraphicsImageRenderer(size: image.size)
-        
-        return renderer.image { context in
-            // Draw the original signature (preserves transparency)
-            image.draw(in: rect)
-            
-            // Use 'sourceIn' blend mode to only color non-transparent pixels (the ink)
-            context.cgContext.setBlendMode(.sourceIn)
-            context.cgContext.setFillColor(color.uiColor.cgColor)
-            context.cgContext.fill(rect)
-        }
-    }
+
+    // NOTE: Color is now applied at render-time (SwiftUI template tint + PDFAnnotation draw-time tint).
+    // Keeping this removed helper out prevents accidental reintroduction of heavy image regeneration.
 }
 
 // MARK: - Inline Selection Box
@@ -2191,7 +2042,7 @@ struct InlineSelectionBoxView: View {
     let position: CGPoint
     let size: CGSize
     let rotation: CGFloat
-    let scaleFactor: CGFloat  // PDFView scale factor for handle scaling
+    let scaleFactor: CGFloat
     let onMove: (CGSize) -> Void
     let onResize: (CGFloat) -> Void
     let onResizeEnd: () -> Void
@@ -2199,153 +2050,117 @@ struct InlineSelectionBoxView: View {
     let onRotateEnd: () -> Void
     let onGestureStart: () -> Void
     
-    // Calculate handle size inversely proportional to zoom (keeps handles constant visual size)
-    private var handleSize: CGFloat {
-        // Visual Fix: Use 14 as base. Max size 18, Min size 8.
-        // This keeps them from ever feeling "Clunky"
-        max(8, min(18, 14 / scaleFactor))
-    }
-    
-    // Rotation/resize tracking
     @State private var gesturePivot: CGPoint? = nil
     @State private var startRotation: CGFloat = 0
     @State private var startAngle: CGFloat? = nil
     @State private var resizeStartRotation: CGFloat? = nil
     @State private var resizeStartDX: CGFloat? = nil
+
+    private var safeScale: CGFloat { max(0.1, scaleFactor) }
+    private var handleSize: CGFloat { max(10, min(18, 12 / safeScale)) }
+    // UI request: yellow outline + yellow handles (same thickness)
+    private var selectionColor: Color { .yellow }
     
     var body: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 4)
-                .stroke(Color.yellow, lineWidth: 1.2 / scaleFactor)  // ROOT FIX: Visual thinness
+            // 1. The Border - Clean, thin, blue
+            Rectangle()
+                // Thinner per request (still scaled by zoom)
+                .stroke(selectionColor, lineWidth: 0.7 / safeScale)
                 .frame(width: size.width, height: size.height)
                 .rotationEffect(.degrees(rotation))
                 .position(position)
             
+            // The corner handles (Separated to fix compiler crash)
+            handlesLayer
+            
+            // The rotation handle
+            rotationHandleIcon
+        }
+    }
+
+    private var handlesLayer: some View {
             ForEach(0..<4) { index in
                 Circle()
-                    .fill(Color.yellow)
-                    .frame(width: handleSize, height: handleSize)
-                    .overlay(Circle().stroke(Color.white, lineWidth: 0.8 / scaleFactor))  // Sharp white ring
+                .fill(selectionColor)
+                .frame(width: handleSize, height: handleSize)
                     .position(rotatedCornerPosition(for: index))
-                    .gesture(
+                .gesture(cornerDragGesture)
+        }
+    }
+
+    private var cornerDragGesture: some Gesture {
                         DragGesture(minimumDistance: 0)
                             .onChanged { value in
-                                let pivot = position
-                                // lock rotation at gesture start
                                 if resizeStartRotation == nil {
                                             onGestureStart()
                                     resizeStartRotation = rotation
                                 }
                                 let radians = -(resizeStartRotation ?? 0) * .pi / 180
-                                
-                                let dx = value.location.x - pivot.x
-                                let dy = value.location.y - pivot.y
+                let dx = value.location.x - position.x
+                let dy = value.location.y - position.y
                                 let localDX = dx * cos(radians) - dy * sin(radians)
-                                
                                 if resizeStartDX == nil {
-                                    let sdx = (value.startLocation.x - pivot.x) * cos(radians) - (value.startLocation.y - pivot.y) * sin(radians)
-                                    resizeStartDX = sdx
+                    resizeStartDX = (value.startLocation.x - position.x) * cos(radians) - (value.startLocation.y - position.y) * sin(radians)
                                 }
                                 guard let startDX = resizeStartDX, abs(startDX) > 0.1 else { return }
-                                
-                                let scaleFactor = localDX / startDX
-                                onResize(scaleFactor)
+                onResize(localDX / startDX)
                             }
                             .onEnded { _ in
-                                resizeStartRotation = nil
-                                resizeStartDX = nil
-                                onResizeEnd()
+                resizeStartRotation = nil; resizeStartDX = nil; onResizeEnd()
                             }
-                    )
             }
             
+    private var rotationHandleIcon: some View {
             Image(systemName: "arrow.triangle.2.circlepath")
-                .font(.system(size: max(12, min(20, 16 / scaleFactor))))
+            .font(.system(size: max(10, min(16, 12 / safeScale))))
                 .foregroundColor(.white)
-                .frame(width: handleSize, height: handleSize)
-                .background(Color(white: 0.3, opacity: 0.9))
+            .frame(width: handleSize + 4, height: handleSize + 4)
+            .background(selectionColor.opacity(0.9))
                 .clipShape(Circle())
                 .position(rotatedRotationHandlePosition)
-                .gesture(
+            .gesture(rotationGesture)
+    }
+
+    private var rotationGesture: some Gesture {
                     DragGesture()
                         .onChanged { value in
                             if gesturePivot == nil {
                                     onGestureStart()
                                 gesturePivot = position
-                                startRotation = rotation
-                                startAngle = angle(from: position, to: value.startLocation)
-                                        // #region agent log
-                                        DocumentReviewView.debugLog(
-                                            hypothesisId: "H8",
-                                            message: "selection box gesture start",
-                                            data: [
-                                        "startAngle": startAngle ?? -999,
-                                                "capturedRotation": rotation,
-                                                "position": ["x": position.x, "y": position.y],
-                                                "size": ["w": size.width, "h": size.height]
-                                            ]
-                                        )
-                                        // #endregion
-                            }
-                            
-                            guard let pivot = gesturePivot, let sAngle = startAngle else { return }
-                            
-                            let current = angle(from: pivot, to: value.location)
-                            let delta = normalizeAngle(current - sAngle)
-                            
-                        onRotate(delta) // pass delta; parent adds to its captured base
+                    startAngle = atan2(value.startLocation.y - position.y, value.startLocation.x - position.x) * 180 / .pi
+                }
+                let currentAngle = atan2(value.location.y - position.y, value.location.x - position.x) * 180 / .pi
+                var delta = currentAngle - (startAngle ?? 0)
+                if delta > 180 { delta -= 360 } else if delta < -180 { delta += 360 }
+                onRotate(delta)
                         }
                         .onEnded { _ in
-                            gesturePivot = nil
-                            startAngle = nil
-                            onRotateEnd()
-                        }
-                )
-        }
+                gesturePivot = nil; startAngle = nil; onRotateEnd()
+            }
     }
-    
-    private func cornerPosition(for index: Int) -> CGPoint {
-        let halfWidth = size.width / 2
-        let halfHeight = size.height / 2
-        switch index {
-        case 0: return CGPoint(x: position.x - halfWidth, y: position.y - halfHeight)
-        case 1: return CGPoint(x: position.x + halfWidth, y: position.y - halfHeight)
-        case 2: return CGPoint(x: position.x + halfWidth, y: position.y + halfHeight)
-        case 3: return CGPoint(x: position.x - halfWidth, y: position.y + halfHeight)
-        default: return position
-        }
-    }
-    
-    private var rotationHandlePosition: CGPoint {
-        CGPoint(x: position.x, y: position.y - size.height / 2 - 20)
-    }
-    
-    private func rotatedPoint(_ point: CGPoint, around center: CGPoint, degrees: CGFloat) -> CGPoint {
-        let radians = degrees * .pi / 180
-        let translatedX = point.x - center.x
-        let translatedY = point.y - center.y
-        let rotatedX = translatedX * cos(radians) - translatedY * sin(radians)
-        let rotatedY = translatedX * sin(radians) + translatedY * cos(radians)
-        return CGPoint(x: rotatedX + center.x, y: rotatedY + center.y)
-    }
-    
+
+    // Helper functions
     private func rotatedCornerPosition(for index: Int) -> CGPoint {
-        rotatedPoint(cornerPosition(for: index), around: position, degrees: rotation)
+        let halfW = size.width / 2; let halfH = size.height / 2
+        let p: CGPoint
+        switch index {
+        case 0: p = CGPoint(x: position.x - halfW, y: position.y - halfH)
+        case 1: p = CGPoint(x: position.x + halfW, y: position.y - halfH)
+        case 2: p = CGPoint(x: position.x + halfW, y: position.y + halfH)
+        default: p = CGPoint(x: position.x - halfW, y: position.y + halfH)
+        }
+        return rotate(p, around: position, by: rotation)
     }
     
     private var rotatedRotationHandlePosition: CGPoint {
-        rotatedPoint(rotationHandlePosition, around: position, degrees: rotation)
+        rotate(CGPoint(x: position.x, y: position.y - size.height / 2 - 20), around: position, by: rotation)
     }
 
-    private func angle(from c: CGPoint, to p: CGPoint) -> CGFloat {
-        atan2(p.y - c.y, p.x - c.x) * 180 / .pi
-    }
-
-    private func normalizeAngle(_ angle: CGFloat) -> CGFloat {
-        var a = angle
-        if a > 180 { a -= 360 }
-        if a < -180 { a += 360 }
-        return a
+    private func rotate(_ point: CGPoint, around center: CGPoint, by degrees: CGFloat) -> CGPoint {
+        let rad = degrees * .pi / 180
+        let tx = point.x - center.x; let ty = point.y - center.y
+        return CGPoint(x: tx * cos(rad) - ty * sin(rad) + center.x, y: tx * sin(rad) + ty * cos(rad) + center.y)
     }
 }
 
@@ -2356,6 +2171,7 @@ struct PDFViewRepresentable: UIViewRepresentable {
     @Binding var pdfViewInstance: PDFView?  // Binding to expose PDFView to parent
     @Binding var refreshTrigger: UUID  // Triggers SwiftUI recalculation during zoom
     var disableTapGestures: Bool = false
+    // ROOT FIX: Background tap is now handled by tap router gesture on ZStack (removed parameter)
     
     func makeUIView(context: Context) -> PDFView {
         let pdfView = PDFView()
@@ -2366,42 +2182,88 @@ struct PDFViewRepresentable: UIViewRepresentable {
         pdfView.displayDirection = .horizontal
         pdfView.autoScales = true
         pdfView.backgroundColor = .systemBackground
-        pdfView.isUserInteractionEnabled = true
+        pdfView.isUserInteractionEnabled = true // Must be true for gestures to pass through
         pdfView.displaysAsBook = false
         pdfView.displaysPageBreaks = false
         
-        pdfView.maxScaleFactor = 5.0
-        pdfView.minScaleFactor = 0.1
+        // ROOT FIX: THE "STATIC FLOOR" - Disable native selection engine completely
+        // Note: isSelectable is macOS-only, so we disable via gesture recognizers and delegate methods
+        
+        // ROOT FIX: Lock zoom - disable completely (min = max = fitScale locks it)
+        // Will be set to fitScale in async block below
         
         pdfView.delegate = coordinator
         
-        // Disable double-tap to zoom to prevent shape changes
+        // Disable double-tap to zoom
         pdfView.gestureRecognizers?.forEach { recognizer in
             if let tapRecognizer = recognizer as? UITapGestureRecognizer,
                tapRecognizer.numberOfTapsRequired == 2 {
                 recognizer.isEnabled = false
             }
+            // ROOT FIX: Disable pinch gesture completely
+            if recognizer is UIPinchGestureRecognizer {
+                recognizer.isEnabled = false
+            }
+        }
+        
+        // ROOT FIX: HARD LOCKDOWN OF GESTURE RECOGNIZERS
+        // Kill the Long Press (Magnifying glass / Copy Menu)
+        pdfView.gestureRecognizers?.forEach { recognizer in
+            // Kill the Long Press (Magnifying glass / Copy Menu)
+            if recognizer is UILongPressGestureRecognizer {
+                recognizer.isEnabled = false
+            }
+            
+            // Kill the native Drag-to-Select (Text selection handles)
+            if let pan = recognizer as? UIPanGestureRecognizer, pan.numberOfTouches == 1 {
+                recognizer.isEnabled = false
+            }
+        }
+        
+        // Disable text selection by preventing menu controllers
+        // This prevents the copy/paste menu from appearing
+        if #available(iOS 13.0, *) {
+            pdfView.isOpaque = false
         }
         
         coordinator.setupTapGestureHandling(pdfView: pdfView)
         
+        // ROOT FIX: Background tap is now handled by tap router gesture on ZStack (removed recognizer here)
+        
         // ROOT FIX: Hide the view until it fits perfectly
         pdfView.alpha = 0
         
-        // ADD THIS: Redraw every time the user pinches to fix ghost trails
-        coordinator.setupZoomObserver(pdfView: pdfView)
-        coordinator.pdfViewInstance = pdfView  // Set reference for zoom observer
+        // REMOVED: No zoom observer needed since zoom is completely disabled
+        coordinator.pdfViewInstance = pdfView
         
-        // Fade in after layout is complete
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            UIView.animate(withDuration: 0.2) {
+        // ROOT FIX: Lock to fit scale and never allow changes (zoom disabled)
+        DispatchQueue.main.async {
+            let fitScale = pdfView.scaleFactorForSizeToFit
+            if fitScale > 0 {
+                pdfView.scaleFactor = fitScale
+                // Lock it - same min and max prevents any zoom
+            pdfView.minScaleFactor = fitScale
+            pdfView.maxScaleFactor = fitScale
+        }
+        
+            // ROOT FIX: Final lockdown after view is ready
+            // Text selection is disabled via gesture recognizers and delegate methods (isSelectable is macOS-only)
+            
+            // Hide any existing menu controllers (copy/paste menu)
+            UIMenuController.shared.hideMenu()
+            UIMenuController.shared.isMenuVisible = false
+            
+            // Disable all long press gestures again (in case PDFKit adds more)
+        pdfView.gestureRecognizers?.forEach { recognizer in
+                if recognizer is UILongPressGestureRecognizer {
+                recognizer.isEnabled = false
+            }
+        }
+        
+            self.pdfViewInstance = pdfView
+            UIView.animate(withDuration: 0.2, delay: 0.1) {
                 pdfView.alpha = 1
             }
-            // Set fit scale after fade-in
-            let fitScale = pdfView.scaleFactorForSizeToFit
-            pdfView.scaleFactor = fitScale
-            pdfView.minScaleFactor = fitScale * 0.2
-            self.pdfViewInstance = pdfView
         }
         
         return pdfView
@@ -2413,10 +2275,27 @@ struct PDFViewRepresentable: UIViewRepresentable {
             uiView.document = pdfDocument
         }
         
-        // Update instance reference
-        DispatchQueue.main.async {
-            self.pdfViewInstance = uiView
+        // ROOT FIX: Ensure PDFView shows the correct page when pageIndex changes
+        // This prevents page duplication bug where content from one page appears on another
+        if let targetPage = pdfDocument.page(at: pageIndex),
+           uiView.currentPage != targetPage {
+            // Only change page if it's actually different to avoid unnecessary updates
+                uiView.go(to: targetPage)
+            }
+        
+        // ROOT FIX: Re-lock zoom after page changes (prevent any drift)
+        let fitScale = uiView.scaleFactorForSizeToFit
+        if fitScale > 0 {
+            uiView.scaleFactor = fitScale
+            uiView.minScaleFactor = fitScale
+            uiView.maxScaleFactor = fitScale
         }
+        
+        // ROOT FIX: Maintain "static floor" - selection disabled via gesture recognizers and delegate
+        // (isSelectable is macOS-only, not available on iOS)
+        
+        // Direct assignment - updateUIView is already called on main thread
+        self.pdfViewInstance = uiView
     }
     
     func makeCoordinator() -> Coordinator {
@@ -2431,10 +2310,16 @@ struct PDFViewRepresentable: UIViewRepresentable {
         var preservedScale: CGFloat = 0
         var preservedOffset: CGPoint = .zero
         weak var pdfViewInstance: PDFView?  // Reference for the refresh
+        // ROOT FIX: Background tap is now handled by tap router gesture on ZStack (removed property)
         
         init(pageIndex: Binding<Int>, refreshTrigger: Binding<UUID>) {
             _pageIndex = pageIndex
             _refreshTrigger = refreshTrigger
+        }
+        
+        // CURSOR FIX: Cleanup observer to prevent memory leaks
+        deinit {
+            NotificationCenter.default.removeObserver(self)
         }
         
         @MainActor
@@ -2448,22 +2333,6 @@ struct PDFViewRepresentable: UIViewRepresentable {
         }
         
         @MainActor
-        func setupZoomObserver(pdfView: PDFView) {
-            // This is the "Magic Fix" for ghost trails during zoom
-            NotificationCenter.default.addObserver(
-                self,
-                selector: #selector(handleScaleChange),
-                name: .PDFViewScaleChanged,
-                object: pdfView
-            )
-        }
-        
-        @objc func handleScaleChange() {
-            // ROOT FIX: Force SwiftUI to re-calculate the sticker positions during zoom
-            refreshTrigger = UUID()
-        }
-        
-        @MainActor
         func updateTapGestureHandling(pdfView: PDFView, disable: Bool) {
             singleTapRecognizers.forEach { recognizer in
                 recognizer.isEnabled = !disable
@@ -2472,6 +2341,9 @@ struct PDFViewRepresentable: UIViewRepresentable {
                 setupTapGestureHandling(pdfView: pdfView)
             }
         }
+        
+        // ROOT FIX: Handle background tap for deselection
+        // ROOT FIX: Background tap is now handled by tap router gesture on ZStack (removed method)
         
         @MainActor
         func pdfViewDidChangeVisiblePages(_ notification: Notification) {
@@ -2482,6 +2354,20 @@ struct PDFViewRepresentable: UIViewRepresentable {
             if index != NSNotFound {
                 self.pageIndex = index
             }
+        }
+        
+        // ROOT FIX: Prevent text selection by returning nil for selection
+        @MainActor
+        func pdfView(_ pdfView: PDFView, willSelect selection: PDFSelection, on page: PDFPage) -> PDFSelection? {
+            // Return nil to prevent any text selection
+            return nil
+        }
+        
+        // ROOT FIX: Prevent menu actions (copy, etc.) from appearing
+        @MainActor
+        func pdfView(_ pdfView: PDFView, performAction action: Selector, for sender: Any?) -> Bool {
+            // Block all menu actions (copy, select all, etc.)
+            return false
         }
     }
             }

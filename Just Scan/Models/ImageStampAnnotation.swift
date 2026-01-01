@@ -12,6 +12,9 @@ class ImageStampAnnotation: PDFAnnotation {
     var originalRotation: CGFloat
     var originalColor: SignatureColor
     var originalAspectRatio: CGFloat
+    // CRITICAL: Persist the intended (unrotated) widthRatio so reopening / reselecting doesn't "grow" the signature.
+    // Annotation bounds include rotation padding, so deriving widthRatio from bounds causes inflation.
+    var originalWidthRatio: CGFloat
     private var storedImageData: Data?
     var isLocked: Bool = false
     var imageSnapshot: UIImage? {
@@ -23,6 +26,20 @@ class ImageStampAnnotation: PDFAnnotation {
         self.storedImageData = image.pngData()
         updateContents()
     }
+
+    // CRITICAL: Avoid repeatedly regenerating/encoding the same image (huge CPU+memory spike).
+    func updateImageIfNeeded(_ image: UIImage) {
+        // Compare encoded bytes (cheap-ish) before replacing; prevents thrash on color changes.
+        let newData = image.pngData()
+        if storedImageData == newData { return }
+        storedImageData = newData
+        updateContents()
+    }
+
+    private func signatureUIColor() -> UIColor {
+        // Default to black if enum doesn't resolve
+        return originalColor.uiColor
+    }
     
     private func updateContents() {
         guard let data = storedImageData else { return }
@@ -31,6 +48,7 @@ class ImageStampAnnotation: PDFAnnotation {
             "rotation": originalRotation,
             "color": originalColor.rawValue,
             "aspectRatio": originalAspectRatio,
+            "widthRatio": originalWidthRatio,
             "imageDataB64": b64
         ]
         if let jsonData = try? JSONSerialization.data(withJSONObject: metadata, options: []),
@@ -39,10 +57,11 @@ class ImageStampAnnotation: PDFAnnotation {
         }
     }
     
-    init(bounds: CGRect, image: UIImage, rotation: CGFloat, color: SignatureColor, aspectRatio: CGFloat) {
+    init(bounds: CGRect, image: UIImage, rotation: CGFloat, color: SignatureColor, aspectRatio: CGFloat, widthRatio: CGFloat) {
         self.originalRotation = rotation
         self.originalColor = color
         self.originalAspectRatio = aspectRatio
+        self.originalWidthRatio = widthRatio
         
         super.init(bounds: bounds, forType: .stamp, withProperties: nil)
         
@@ -74,6 +93,12 @@ class ImageStampAnnotation: PDFAnnotation {
         } else {
             originalAspectRatio = 2.0
         }
+
+        if coder.containsValue(forKey: "originalWidthRatio") {
+            originalWidthRatio = CGFloat(coder.decodeDouble(forKey: "originalWidthRatio"))
+        } else {
+            originalWidthRatio = 0.2
+        }
         
         storedImageData = coder.decodeObject(of: NSData.self, forKey: "storedImageData") as Data?
         
@@ -85,6 +110,7 @@ class ImageStampAnnotation: PDFAnnotation {
         coder.encode(Double(originalRotation), forKey: "originalRotation")
         coder.encode(originalColor.rawValue, forKey: "originalColor")
         coder.encode(Double(originalAspectRatio), forKey: "originalAspectRatio")
+        coder.encode(Double(originalWidthRatio), forKey: "originalWidthRatio")
         if let imageData = storedImageData {
             coder.encode(imageData as NSData, forKey: "storedImageData")
         }
@@ -122,7 +148,14 @@ class ImageStampAnnotation: PDFAnnotation {
             height: bounds.height
         )
         
+        // Draw image, then tint non-transparent pixels using sourceIn (cheap compared to regenerating a new UIImage)
         context.draw(cgImage, in: imageRect)
+        if originalColor != .black {
+            context.setBlendMode(.sourceIn)
+            context.setFillColor(signatureUIColor().cgColor)
+            context.fill(imageRect)
+            context.setBlendMode(.normal)
+        }
         
         // Restore graphics state
         context.restoreGState()

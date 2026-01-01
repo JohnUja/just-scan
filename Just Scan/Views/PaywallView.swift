@@ -17,7 +17,7 @@ struct PaywallView: View {
     @State private var developerTapCount = 0
     @State private var showDeveloperBypass = false
     
-    // DEVELOPER BYPASS: Set to false before App Store release
+    // DEVELOPER BYPASS: Enabled for testing - Set to false before App Store release
     private let developerBypassEnabled = true
     
     var body: some View {

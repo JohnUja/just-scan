@@ -17,7 +17,7 @@ class StoreManager: ObservableObject {
     
     private let productID = "com.justscan.onetime" // You'll need to create this in App Store Connect
     
-    // DEVELOPER BYPASS: Set to false before App Store release
+    // DEVELOPER BYPASS: Remove this before App Store release
     private var developerBypass: Bool {
         get {
             UserDefaults.standard.bool(forKey: "developerBypassPurchased")
@@ -37,6 +37,7 @@ class StoreManager: ObservableObject {
         developerBypass || purchasedProductIDs.contains(productID)
     }
     
+    // DEVELOPER BYPASS: Remove this function before App Store release
     func setDeveloperBypass(_ enabled: Bool) {
         developerBypass = enabled
         // Trigger view update

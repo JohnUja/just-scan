@@ -15,18 +15,41 @@ struct DocumentGridView: View {
     let onRename: () -> Void
     let onDelete: () -> Void
     
+    private var displayName: String {
+        // Match Files.app style: show name without the .pdf extension
+        document.fileName.replacingOccurrences(of: ".pdf", with: "")
+    }
+    
+    private var displayDate: Date {
+        // Prefer last modified (Files-style), fallback to createdAt
+        document.lastModified ?? document.createdAt
+    }
+    
     var body: some View {
-        VStack(spacing: 4) {
+        VStack(alignment: .leading, spacing: 6) {
             // PDF thumbnail
             PDFThumbnailView(documentURL: document.fileURL)
                 .aspectRatio(1, contentMode: .fit)
                 .clipShape(RoundedRectangle(cornerRadius: 8))
                 .contentShape(Rectangle()) // Make entire area tappable
             
-            // Date label
-            Text(formatDate(document.createdAt))
+            // Name + metadata (Files-style: name, then time/date, then size)
+            Text(displayName)
+                .font(.caption)
+                .fontWeight(.medium)
+                .foregroundColor(.primary)
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
+            
+            Text(formatFilesStyleDate(displayDate))
                 .font(.caption2)
                 .foregroundColor(.secondary)
+                .lineLimit(1)
+            
+            Text(document.fileSizeString)
+                .font(.caption2)
+                .foregroundColor(.secondary)
+                .lineLimit(1)
         }
         .contentShape(Rectangle()) // Make entire VStack tappable
         .onTapGesture {
@@ -61,11 +84,27 @@ struct DocumentGridView: View {
         }
     }
     
-    private func formatDate(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "MMM d"
-        return formatter.string(from: date)
+    private func formatFilesStyleDate(_ date: Date) -> String {
+        // Files.app behavior: show time if it's today, otherwise show a short date in the user's locale.
+        if Calendar.current.isDateInToday(date) {
+            return Self.timeFormatter.string(from: date)
+        }
+        return Self.dateFormatter.string(from: date)
     }
+    
+    private static let timeFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.timeStyle = .short
+        f.dateStyle = .none
+        return f
+    }()
+    
+    private static let dateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.timeStyle = .none
+        f.dateStyle = .short
+        return f
+    }()
 }
 
 struct PDFThumbnailView: View {
