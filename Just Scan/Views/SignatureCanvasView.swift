@@ -225,9 +225,9 @@ struct SignatureCanvasView: View {
         }
         
         if signatureService.saveSignature(image) {
-            dismiss()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                onSave?()
+        dismiss()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            onSave?()
             }
         } else {
             // Show alert for maximum signature limit

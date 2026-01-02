@@ -1,19 +1,6 @@
 import SwiftUI
 import CoreGraphics
 
-// ROOT FIX: Moving the enum here ensures it is visible to ALL files in your project.
-enum SignatureColor: String, CaseIterable, Codable {
-    case black, blue, red
-    
-    var uiColor: UIColor {
-        switch self {
-        case .black: return .black
-        case .blue: return .systemBlue
-        case .red: return .systemRed
-        }
-    }
-}
-
 struct GeometryMath {
     /// Calculates the bounding box of a rotated rectangle.
     static func rotatedRect(size: CGSize, degrees: CGFloat) -> CGSize {

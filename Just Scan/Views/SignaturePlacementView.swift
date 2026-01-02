@@ -376,6 +376,40 @@ struct SignaturePlacementView: View {
     }
 }
 
+// MARK: - Resize Handle
+private struct ResizeHandle: View {
+    enum Position {
+        case topLeft, topRight, bottomLeft, bottomRight
+    }
+    
+    let position: Position
+    
+    var body: some View {
+        Circle()
+            .fill(Color.yellow)
+            .frame(width: 16, height: 16)
+            .overlay(
+                Circle()
+                    .stroke(Color.white, lineWidth: 2)
+            )
+    }
+}
+
+// MARK: - Rotation Handle
+private struct RotationHandle: View {
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(Color.blue)
+                .frame(width: 20, height: 20)
+            
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .font(.system(size: 10, weight: .bold))
+                .foregroundColor(.white)
+        }
+    }
+}
+
 // MARK: - Selection Box
 struct SelectionBoxView: View {
     let position: CGPoint
@@ -388,27 +422,94 @@ struct SelectionBoxView: View {
     @State private var lastDragLocation: CGPoint = .zero
     @State private var lastResizeDistance: CGFloat = 0
     @State private var lastRotationAngle: CGFloat = 0
+    @State private var isDragging: Bool = false
+    @State private var showWarning: Bool = false
+    @State private var hasStartedDrag: Bool = false // Track if drag has started (minimum distance)
+    
+    private let handleSize: CGFloat = 24
+    private let minSize: CGFloat = 40
     
     var body: some View {
         ZStack {
-            // Yellow border
-            RoundedRectangle(cornerRadius: 4)
+            // FIXED: Selection box that doesn't stretch - use fixed frame size
+            Rectangle()
                 .stroke(Color.yellow, lineWidth: 2)
-                .frame(width: size.width, height: size.height)
-                .position(position)
+                .frame(width: max(minSize, abs(size.width)), height: max(minSize, abs(size.height)))
+                .overlay(
+                    // Corner handles
+                    GeometryReader { geometry in
+                        Group {
+                            // Top-left resize handle
+                            ResizeHandle(position: .topLeft)
+                                .position(x: 0, y: 0)
+                            
+                            // Top-right resize handle + rotation
+                            RotationHandle()
+                                .position(x: geometry.size.width, y: 0)
+                            
+                            // Bottom-left resize handle
+                            ResizeHandle(position: .bottomLeft)
+                                .position(x: 0, y: geometry.size.height)
+                            
+                            // Bottom-right resize handle
+                            ResizeHandle(position: .bottomRight)
+                                .position(x: geometry.size.width, y: geometry.size.height)
+                        }
+                    }
+                )
                 .rotationEffect(.degrees(rotation))
+                .position(position)
             
-            // Center drag area - movement handled by signature image gesture above
-            // This is just a visual overlay, touches pass through
-            RoundedRectangle(cornerRadius: 4)
+            // Warning icon when near borders
+            if showWarning {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundColor(.orange)
+                    .font(.system(size: 20))
+                    .position(CGPoint(x: position.x, y: position.y - size.height/2 - 30))
+            }
+            
+            // Center drag area for movement (transparent, tappable)
+            Rectangle()
                 .fill(Color.clear)
                 .frame(width: size.width, height: size.height)
-                .position(position)
                 .rotationEffect(.degrees(rotation))
+                .position(position)
                 .contentShape(Rectangle())
-                .allowsHitTesting(false) // Let touches pass through to image gesture
+                .gesture(
+                    DragGesture(minimumDistance: 10) // Require 10pt movement before drag starts (prevents tap from moving)
+                        .onChanged { value in
+                            // Check if we've moved enough to start dragging
+                            let distance = sqrt(
+                                pow(value.location.x - value.startLocation.x, 2) +
+                                pow(value.location.y - value.startLocation.y, 2)
+                            )
+                            
+                            if distance < 10 && !hasStartedDrag {
+                                return // Don't start drag until minimum distance
+                            }
+                            
+                            if !hasStartedDrag {
+                                hasStartedDrag = true
+                                isDragging = true
+                                lastDragLocation = value.startLocation
+                            }
+                            
+                            // Don't invert Y - let controller handle coordinate conversion
+                            let delta = CGSize(
+                                width: value.location.x - lastDragLocation.x,
+                                height: value.location.y - lastDragLocation.y
+                            )
+                            onMove(delta)
+                            lastDragLocation = value.location
+                        }
+                        .onEnded { _ in
+                            lastDragLocation = .zero
+                            isDragging = false
+                            hasStartedDrag = false
+                        }
+                )
             
-            // Corner resize handles
+            // FOUR CORNER HANDLES ONLY (not 8)
             ForEach(0..<4) { index in
                 Circle()
                     .fill(Color.yellow)
@@ -445,11 +546,13 @@ struct SelectionBoxView: View {
                     )
             }
             
-            // Rotation handle
-            Circle()
-                .fill(Color.yellow)
-                .frame(width: 24, height: 24)
-                .overlay(Circle().stroke(Color.white, lineWidth: 2))
+            // Rotation handle (using icon from old code, positioned above top edge)
+            Image(systemName: "arrow.triangle.2.circlepath")
+                .font(.system(size: 14, weight: .medium))
+                .foregroundColor(.white)
+                .frame(width: 28, height: 28)
+                .background(Color.blue.opacity(0.8))
+                .clipShape(Circle())
                 .position(rotationHandlePosition)
                 .gesture(
                     DragGesture()
@@ -473,8 +576,16 @@ struct SelectionBoxView: View {
                         }
                 )
         }
+        .onAppear {
+            // Check if near borders and show warning
+            checkBorders()
+        }
+        .onChange(of: position) { _ in
+            checkBorders()
+        }
     }
     
+    // Helper - only 4 corners (not 8)
     private func cornerPosition(for index: Int) -> CGPoint {
         let corners: [(CGFloat, CGFloat)] = [
             (-size.width/2, -size.height/2), // Top-left
@@ -492,18 +603,27 @@ struct SelectionBoxView: View {
     }
     
     private var rotationHandlePosition: CGPoint {
+        // Position above top edge, between toolbar and selection box
         let angle = (rotation - 90) * .pi / 180
-        let distance = size.height / 2 + 35
+        let distance = size.height / 2 + 25 // Between toolbar and box
         return CGPoint(
             x: position.x + distance * cos(angle),
             y: position.y + distance * sin(angle)
         )
+    }
+    
+    private func checkBorders() {
+        // Simple border check - show warning if near edges
+        // This is a placeholder - actual implementation would check against PDF page bounds
+        let margin: CGFloat = 50
+        showWarning = position.x < margin || position.y < margin
     }
 }
 
 // MARK: - Floating Toolbar (Apple-style subtle)
 struct FloatingToolbarView: View {
     let position: CGPoint
+    let onMove: (() -> Void)?
     let onColor: () -> Void
     let onDelete: () -> Void
     let onDuplicate: () -> Void
@@ -511,9 +631,43 @@ struct FloatingToolbarView: View {
     let onPaste: () -> Void
     let canPaste: Bool
     
+    init(
+        position: CGPoint,
+        onMove: (() -> Void)? = nil,
+        onColor: @escaping () -> Void,
+        onDelete: @escaping () -> Void,
+        onDuplicate: @escaping () -> Void,
+        onCopy: @escaping () -> Void,
+        onPaste: @escaping () -> Void,
+        canPaste: Bool
+    ) {
+        self.position = position
+        self.onMove = onMove
+        self.onColor = onColor
+        self.onDelete = onDelete
+        self.onDuplicate = onDuplicate
+        self.onCopy = onCopy
+        self.onPaste = onPaste
+        self.canPaste = canPaste
+    }
+    
     var body: some View {
         HStack(spacing: 8) {
-            // Color picker
+            // Move button (first, if provided)
+            if let onMove = onMove {
+                Button {
+                    onMove()
+                } label: {
+                    Image(systemName: "arrow.up.and.down.and.arrow.left.and.right")
+                        .font(.system(size: 16))
+                        .foregroundColor(.white)
+                        .frame(width: 36, height: 36)
+                        .background(Color(white: 0.3, opacity: 0.9))
+                        .clipShape(Circle())
+                }
+            }
+            
+            // Color picker (switched with duplicate)
             Button {
                 onColor()
             } label: {
@@ -525,11 +679,11 @@ struct FloatingToolbarView: View {
                     .clipShape(Circle())
             }
             
-            // Copy
+            // Duplicate (switched with color)
             Button {
-                onCopy()
+                onDuplicate()
             } label: {
-                Image(systemName: "doc.on.doc")
+                Image(systemName: "square.on.square")
                     .font(.system(size: 16))
                     .foregroundColor(.white)
                     .frame(width: 36, height: 36)
@@ -551,25 +705,13 @@ struct FloatingToolbarView: View {
                 }
             }
             
-            // Duplicate
-            Button {
-                onDuplicate()
-            } label: {
-                Image(systemName: "square.on.square")
-                    .font(.system(size: 16))
-                    .foregroundColor(.white)
-                    .frame(width: 36, height: 36)
-                    .background(Color(white: 0.3, opacity: 0.9))
-                    .clipShape(Circle())
-            }
-            
-            // Delete
+            // Delete (red fill, grey background)
             Button {
                 onDelete()
             } label: {
                 Image(systemName: "trash.fill")
                     .font(.system(size: 16))
-                    .foregroundColor(.white)
+                    .foregroundColor(.red)
                     .frame(width: 36, height: 36)
                     .background(Color(white: 0.3, opacity: 0.9))
                     .clipShape(Circle())
