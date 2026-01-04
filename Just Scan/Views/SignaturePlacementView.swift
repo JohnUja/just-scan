@@ -191,12 +191,17 @@ struct SignaturePlacementView: View {
                         signatureRotation += angle
                         // Normalize rotation
                         signatureRotation = signatureRotation.truncatingRemainder(dividingBy: 360)
-                    }
+                    },
+                    onMoveEnd: {},
+                    onResizeEnd: {},
+                    onRotateEnd: {}
                 )
                 
                 // Floating Toolbar (Apple-style subtle)
                 FloatingToolbarView(
                     position: CGPoint(x: xPos, y: yPos - elementHeight/2 - 50),
+                    onMove: nil,  // ✅ Not needed here, movement handled by image gesture
+                    onMoveEnd: nil,
                     onColor: { showColorPicker = true },
                     onDelete: { dismiss() },
                     onDuplicate: {
@@ -418,6 +423,9 @@ struct SelectionBoxView: View {
     let onMove: (CGSize) -> Void
     let onResize: (CGFloat) -> Void
     let onRotate: (CGFloat) -> Void
+    let onMoveEnd: () -> Void
+    let onResizeEnd: () -> Void
+    let onRotateEnd: () -> Void
     
     @State private var lastDragLocation: CGPoint = .zero
     @State private var lastResizeDistance: CGFloat = 0
@@ -431,32 +439,10 @@ struct SelectionBoxView: View {
     
     var body: some View {
         ZStack {
-            // FIXED: Selection box that doesn't stretch - use fixed frame size
+            // ✅ Selection box - NO overlay handles (removed duplicates)
             Rectangle()
                 .stroke(Color.yellow, lineWidth: 2)
                 .frame(width: max(minSize, abs(size.width)), height: max(minSize, abs(size.height)))
-                .overlay(
-                    // Corner handles
-                    GeometryReader { geometry in
-                        Group {
-                            // Top-left resize handle
-                            ResizeHandle(position: .topLeft)
-                                .position(x: 0, y: 0)
-                            
-                            // Top-right resize handle + rotation
-                            RotationHandle()
-                                .position(x: geometry.size.width, y: 0)
-                            
-                            // Bottom-left resize handle
-                            ResizeHandle(position: .bottomLeft)
-                                .position(x: 0, y: geometry.size.height)
-                            
-                            // Bottom-right resize handle
-                            ResizeHandle(position: .bottomRight)
-                                .position(x: geometry.size.width, y: geometry.size.height)
-                        }
-                    }
-                )
                 .rotationEffect(.degrees(rotation))
                 .position(position)
             
@@ -506,6 +492,7 @@ struct SelectionBoxView: View {
                             lastDragLocation = .zero
                             isDragging = false
                             hasStartedDrag = false
+                            onMoveEnd()
                         }
                 )
             
@@ -542,18 +529,20 @@ struct SelectionBoxView: View {
                             }
                             .onEnded { _ in
                                 lastResizeDistance = 0
+                                onResizeEnd()
                             }
                     )
             }
             
-            // Rotation handle (using icon from old code, positioned above top edge)
+            // ✅ Rotation handle - gray background, positioned above top edge (only one, no duplicates)
             Image(systemName: "arrow.triangle.2.circlepath")
                 .font(.system(size: 14, weight: .medium))
                 .foregroundColor(.white)
                 .frame(width: 28, height: 28)
-                .background(Color.blue.opacity(0.8))
+                .background(Color.gray.opacity(0.8))  // ✅ Gray instead of blue
                 .clipShape(Circle())
                 .position(rotationHandlePosition)
+                .zIndex(3000)  // ✅ Above everything
                 .gesture(
                     DragGesture()
                         .onChanged { value in
@@ -573,6 +562,7 @@ struct SelectionBoxView: View {
                         }
                         .onEnded { _ in
                             lastRotationAngle = 0
+                            onRotateEnd()
                         }
                 )
         }
@@ -603,13 +593,18 @@ struct SelectionBoxView: View {
     }
     
     private var rotationHandlePosition: CGPoint {
-        // Position above top edge, between toolbar and selection box
-        let angle = (rotation - 90) * .pi / 180
-        let distance = size.height / 2 + 25 // Between toolbar and box
-        return CGPoint(
-            x: position.x + distance * cos(angle),
-            y: position.y + distance * sin(angle)
-        )
+        // ✅ Position above top edge, relative to signature size (scales with signature)
+        let angle = rotation * .pi / 180
+        // Distance scales with signature height (at least 30pt, or 20% of height)
+        let baseDistance = max(30, size.height * 0.2)
+        let distance = size.height / 2 + baseDistance
+        // Calculate top-center point of rotated selection box
+        let topCenterX = position.x + (0 * cos(angle) - (-size.height/2) * sin(angle))
+        let topCenterY = position.y + (0 * sin(angle) + (-size.height/2) * cos(angle))
+        // Offset upward along the rotated Y-axis
+        let handleX = topCenterX + distance * sin(angle)
+        let handleY = topCenterY - distance * cos(angle)
+        return CGPoint(x: handleX, y: handleY)
     }
     
     private func checkBorders() {
@@ -620,10 +615,52 @@ struct SelectionBoxView: View {
     }
 }
 
+// MARK: - Move Icon View (draggable)
+private struct MoveIconView: View {
+    let onMove: (CGSize) -> Void
+    let onMoveEnd: (() -> Void)?
+    
+    @State private var lastDragLocation: CGPoint = .zero
+    @State private var hasStartedDrag: Bool = false
+    
+    var body: some View {
+        Image(systemName: "arrow.up.and.down.and.arrow.left.and.right")
+            .font(.system(size: 14))
+            .foregroundColor(.white)
+            .frame(width: 32, height: 32)
+            .background(Color(white: 0.3, opacity: 0.9))
+            .clipShape(Circle())
+            .gesture(
+                // ✅ Drag gesture on move icon to move signature
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        if !hasStartedDrag {
+                            hasStartedDrag = true
+                            lastDragLocation = value.startLocation
+                        }
+                        
+                        // Calculate incremental delta
+                        let delta = CGSize(
+                            width: value.location.x - lastDragLocation.x,
+                            height: value.location.y - lastDragLocation.y
+                        )
+                        onMove(delta)
+                        lastDragLocation = value.location
+                    }
+                    .onEnded { _ in
+                        lastDragLocation = .zero
+                        hasStartedDrag = false
+                        onMoveEnd?()
+                    }
+            )
+    }
+}
+
 // MARK: - Floating Toolbar (Apple-style subtle)
 struct FloatingToolbarView: View {
     let position: CGPoint
-    let onMove: (() -> Void)?
+    let onMove: ((CGSize) -> Void)?  // ✅ Changed to accept CGSize delta
+    let onMoveEnd: (() -> Void)?      // ✅ Added property
     let onColor: () -> Void
     let onDelete: () -> Void
     let onDuplicate: () -> Void
@@ -633,7 +670,8 @@ struct FloatingToolbarView: View {
     
     init(
         position: CGPoint,
-        onMove: (() -> Void)? = nil,
+        onMove: ((CGSize) -> Void)? = nil,  // ✅ Changed signature
+        onMoveEnd: (() -> Void)? = nil,      // ✅ Added parameter
         onColor: @escaping () -> Void,
         onDelete: @escaping () -> Void,
         onDuplicate: @escaping () -> Void,
@@ -643,6 +681,7 @@ struct FloatingToolbarView: View {
     ) {
         self.position = position
         self.onMove = onMove
+        self.onMoveEnd = onMoveEnd
         self.onColor = onColor
         self.onDelete = onDelete
         self.onDuplicate = onDuplicate
@@ -652,19 +691,13 @@ struct FloatingToolbarView: View {
     }
     
     var body: some View {
-        HStack(spacing: 8) {
-            // Move button (first, if provided)
+        HStack(spacing: 6) {  // ✅ Reduced spacing for more compact toolbar
+            // ✅ Move button - draggable to move signature and toolbar together
             if let onMove = onMove {
-                Button {
-                    onMove()
-                } label: {
-                    Image(systemName: "arrow.up.and.down.and.arrow.left.and.right")
-                        .font(.system(size: 16))
-                        .foregroundColor(.white)
-                        .frame(width: 36, height: 36)
-                        .background(Color(white: 0.3, opacity: 0.9))
-                        .clipShape(Circle())
-                }
+                MoveIconView(
+                    onMove: onMove,
+                    onMoveEnd: onMoveEnd
+                )
             }
             
             // Color picker (switched with duplicate)
@@ -672,9 +705,9 @@ struct FloatingToolbarView: View {
                 onColor()
             } label: {
                 Image(systemName: "paintpalette.fill")
-                    .font(.system(size: 16))
+                    .font(.system(size: 14))  // ✅ Slightly smaller
                     .foregroundColor(.white)
-                    .frame(width: 36, height: 36)
+                    .frame(width: 32, height: 32)  // ✅ More compact
                     .background(Color(white: 0.3, opacity: 0.9))
                     .clipShape(Circle())
             }
@@ -684,9 +717,9 @@ struct FloatingToolbarView: View {
                 onDuplicate()
             } label: {
                 Image(systemName: "square.on.square")
-                    .font(.system(size: 16))
+                    .font(.system(size: 14))  // ✅ Slightly smaller
                     .foregroundColor(.white)
-                    .frame(width: 36, height: 36)
+                    .frame(width: 32, height: 32)  // ✅ More compact
                     .background(Color(white: 0.3, opacity: 0.9))
                     .clipShape(Circle())
             }
@@ -717,8 +750,8 @@ struct FloatingToolbarView: View {
                     .clipShape(Circle())
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.horizontal, 8)   // ✅ Reduced horizontal padding
+        .padding(.vertical, 6)     // ✅ Reduced vertical padding for sleeker look
         .background(
             .ultraThinMaterial,
             in: Capsule()

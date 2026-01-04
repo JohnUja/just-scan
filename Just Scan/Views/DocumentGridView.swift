@@ -128,12 +128,16 @@ struct PDFPageView: UIViewRepresentable {
     
     func makeUIView(context: Context) -> PDFView {
         let pdfView = PDFView()
-        pdfView.document = PDFDocument()
-        pdfView.document?.insert(page, at: 0)
+        // ✅ Create document and insert page (annotations are preserved)
+        let doc = PDFDocument()
+        doc.insert(page, at: 0)
+        pdfView.document = doc
         pdfView.autoScales = true
         pdfView.displayMode = .singlePage
         pdfView.displayDirection = .vertical
         pdfView.backgroundColor = .clear
+        // ✅ Ensure annotations are displayed
+        pdfView.displayBox = .mediaBox
         // Disable user interaction to prevent double-tap zoom, but allow parent tap
         pdfView.isUserInteractionEnabled = false
         return pdfView
@@ -142,6 +146,8 @@ struct PDFPageView: UIViewRepresentable {
     func updateUIView(_ uiView: PDFView, context: Context) {
         // Ensure user interaction stays disabled
         uiView.isUserInteractionEnabled = false
+        // ✅ Force refresh to show annotations
+        uiView.setNeedsDisplay()
     }
 }
 

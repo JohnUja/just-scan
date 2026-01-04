@@ -9,6 +9,7 @@
 import UIKit
 import PDFKit
 import Combine
+import CoreImage
 
 /// UIKit view controller that owns all PDF interaction for signatures.
 /// This eliminates gesture conflicts by having a single gesture owner.
@@ -85,6 +86,7 @@ class PDFSignatureEditorController: UIViewController {
     /// Gesture state
     private var gestureStartSignatureID: UUID?
     private var gestureStartRect: CGRect?
+    private var gestureStartCenter: CGPoint?
     private var gestureStartRotation: CGFloat?
     private var gestureStartScale: CGFloat = 1.0
     
@@ -142,16 +144,11 @@ class PDFSignatureEditorController: UIViewController {
         pdfView.layer.addSublayer(overlay)
         overlayLayer = overlay
         
-        // Update overlay when view bounds change
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(updateOverlayFrame),
-            name: UIDevice.orientationDidChangeNotification,
-            object: nil
-        )
+        // Overlay frame will be updated in viewDidLayoutSubviews
     }
     
-    @objc private func updateOverlayFrame() {
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
         overlayLayer?.frame = pdfView.bounds
         renderSignatureOverlays()
     }
@@ -299,29 +296,38 @@ class PDFSignatureEditorController: UIViewController {
         renderSignatureOverlays()
     }
     
+    /// Set active signature (called from SwiftUI via proxy)
+    func setActiveSignature(_ id: UUID?) {
+        activeSignatureID = id
+        activeSignatureIDSubject.send(id)
+        renderSignatureOverlays()
+    }
+    
     /// Delete the active signature
     func deleteActiveSignature() {
         guard let activeID = activeSignatureID else { return }
         
         registerUndoSnapshot(for: currentPageIndex)
         
-        // Remove from signatures array
+        // ✅ Remove from PDF annotation first (if committed)
+        if let page = pdfDocument?.page(at: currentPageIndex),
+           let annotation = findAnnotation(for: activeID, page: page) {
+            page.removeAnnotation(annotation)
+            pdfView.setNeedsDisplay()  // ✅ Force refresh
+        }
+        
+        // ✅ Remove from signatures array
         if var pageSignatures = signatures[currentPageIndex] {
             pageSignatures.removeAll { $0.id == activeID }
             signatures[currentPageIndex] = pageSignatures
-            
-            // If it was committed, remove from PDF
-            if let page = pdfDocument?.page(at: currentPageIndex),
-               let annotation = findAnnotation(for: activeID, page: page) {
-                page.removeAnnotation(annotation)
-            }
         }
         
-        // Clear active selection
+        // ✅ Clear active selection (this removes selection box)
         activeSignatureID = nil
         activeSignatureIDSubject.send(nil)
         hasPendingChangesSubject.send(true)
         
+        // ✅ Refresh overlays (removes any uncommitted signature layers)
         renderSignatureOverlays()
     }
     
@@ -342,11 +348,11 @@ class PDFSignatureEditorController: UIViewController {
         
         // If committed, update annotation
         if signature.isCommitted,
-           let page = pdfDocument?.page(at: currentPageIndex),
-           let annotation = findAnnotation(for: activeID, page: page) as? ImageStampAnnotation {
-            annotation.originalColor = color
-            renderSignatureOverlays()
+           let page = pdfDocument?.page(at: currentPageIndex) {
+            upsertAnnotation(for: signature, on: page)
         }
+        
+        renderSignatureOverlays()
         
         hasPendingChangesSubject.send(true)
     }
@@ -358,23 +364,18 @@ class PDFSignatureEditorController: UIViewController {
         for (pageIndex, pageSignatures) in signatures {
             guard let page = document.page(at: pageIndex) else { continue }
             
-            for var signature in pageSignatures {
-                if !signature.isCommitted {
-                    // Create annotation
-                    if let annotation = createAnnotation(from: signature, page: page) {
-                        page.addAnnotation(annotation)
-                        signature.isCommitted = true
-                        signature.annotationID = annotation.userName
-                        
-                        // Update in array
-                        if var pageSigs = signatures[pageIndex],
-                           let index = pageSigs.firstIndex(where: { $0.id == signature.id }) {
-                            pageSigs[index] = signature
-                            signatures[pageIndex] = pageSigs
-                        }
-                    }
-                }
+            var updated = pageSignatures
+            for i in updated.indices {
+                var sig = updated[i]
+                
+                // Upsert: update existing or create new
+                upsertAnnotation(for: sig, on: page)
+                
+                sig.isCommitted = true
+                sig.annotationID = sig.id.uuidString
+                updated[i] = sig
             }
+            signatures[pageIndex] = updated
         }
         
         renderSignatureOverlays()
@@ -382,17 +383,18 @@ class PDFSignatureEditorController: UIViewController {
     
     /// Save PDF to disk
     func saveToDisk(url: URL) -> Bool {
-        guard let document = pdfDocument,
-              let data = document.dataRepresentation() else { return false }
+        guard let document = pdfDocument else { return false }
         
-        do {
-            try data.write(to: url, options: .atomic)
+        // Make sure everything is actually in PDF as annotations
+        commitAllToPDF()
+        
+        // Prefer PDFDocument.write(to:) to preserve annotations
+        let ok = document.write(to: url)
+        
+        if ok {
             hasPendingChangesSubject.send(false)
-            return true
-        } catch {
-            print("Failed to save PDF: \(error)")
-            return false
         }
+        return ok
     }
     
     /// Undo last action
@@ -454,13 +456,82 @@ class PDFSignatureEditorController: UIViewController {
     }
     
     private func findAnnotation(for signatureID: UUID, page: PDFPage) -> PDFAnnotation? {
-        return page.annotations.first { annotation in
-            // Check if annotation matches signature
-            if annotation is ImageStampAnnotation {
-                // Compare by position and properties (simplified - could be improved)
-                return true // Placeholder - would need to store signatureID in annotation
-            }
-            return false
+        let key = signatureID.uuidString
+        return page.annotations.first(where: { ann in
+            guard let name = ann.value(forAnnotationKey: .name) as? String,
+                  name == SignatureAnnotationKeys.annotationName else { return false }
+            // Match by userName (which equals signatureID)
+            return ann.userName == key
+        })
+    }
+    
+    /// Update annotation bounds directly (for performance during gestures)
+    private func updateAnnotationBounds(_ existing: ImageStampAnnotation, for signature: SignatureModel, page: PDFPage) {
+        let pageBounds = page.bounds(for: .mediaBox)
+        
+        // Base rect from normalized coordinates (unrotated)
+        let baseWidth = signature.widthRatio * pageBounds.width
+        let baseHeight = baseWidth / signature.aspectRatio
+        let baseCenterX = signature.center.x * pageBounds.width
+        let baseCenterY = signature.center.y * pageBounds.height
+        
+        let baseRect = CGRect(
+            x: baseCenterX - baseWidth / 2,
+            y: baseCenterY - baseHeight / 2,
+            width: baseWidth,
+            height: baseHeight
+        )
+        
+        // Calculate padded bounding box for rotation
+        let rotationRadians = abs(signature.rotation.truncatingRemainder(dividingBy: 180)) * .pi / 180
+        let rotatedWidth = abs(cos(rotationRadians)) * baseRect.width + abs(sin(rotationRadians)) * baseRect.height
+        let rotatedHeight = abs(sin(rotationRadians)) * baseRect.width + abs(cos(rotationRadians)) * baseRect.height
+        
+        let boundsWidth = max(rotatedWidth, baseRect.width) * 1.05
+        let boundsHeight = max(rotatedHeight, baseRect.height) * 1.05
+        
+        let bounds = CGRect(
+            x: baseRect.midX - boundsWidth / 2,
+            y: baseRect.midY - boundsHeight / 2,
+            width: boundsWidth,
+            height: boundsHeight
+        )
+        
+        existing.bounds = PDFCoordinateConverter.clampRectToPageBounds(bounds, page: page)
+    }
+    
+    /// Upsert annotation: update existing or create new
+    private func upsertAnnotation(for signature: SignatureModel, on page: PDFPage) {
+        let sigID = signature.id.uuidString
+        
+        if let existing = findAnnotation(for: signature.id, page: page) as? ImageStampAnnotation {
+            // Update bounds
+            updateAnnotationBounds(existing, for: signature, page: page)
+            
+            // Update metadata
+            existing.originalRotation = signature.rotation
+            existing.originalColor = signature.color
+            existing.originalAspectRatio = signature.aspectRatio
+            existing.originalWidthRatio = signature.widthRatio
+            existing.isReadOnly = false
+            existing.userName = sigID
+            existing.setValue(SignatureAnnotationKeys.annotationName, forAnnotationKey: .name)
+            
+            // Update identity fields
+            existing.signatureID = sigID
+            existing.imageID = signature.imageID
+            
+            // Refresh payload
+            existing.updatePayloadIfNeeded()
+            
+            // Just refresh view (no remove/add)
+            pdfView.setNeedsDisplay()
+            return
+        }
+        
+        // Create if missing
+        if let annotation = createAnnotation(from: signature, page: page) {
+            page.addAnnotation(annotation)
         }
     }
     
@@ -506,12 +577,17 @@ class PDFSignatureEditorController: UIViewController {
             rotation: signature.rotation,
             color: signature.color,
             aspectRatio: signature.aspectRatio,
-            widthRatio: signature.widthRatio
+            widthRatio: signature.widthRatio,
+            signatureID: signature.id.uuidString,
+            imageID: signature.imageID
         )
         
-        annotation.setValue("JustScanSignature_v1", forAnnotationKey: .name)
-        annotation.isLocked = true
+        // CRITICAL: Always set both name and userName for consistency
+        annotation.setValue(SignatureAnnotationKeys.annotationName, forAnnotationKey: .name)
+        annotation.userName = signature.id.uuidString
+        
         annotation.shouldPrint = true
+        annotation.isReadOnly = false   // IMPORTANT: keep editable after reopen
         
         return annotation
     }
@@ -525,6 +601,12 @@ class PDFSignatureEditorController: UIViewController {
             guard let page = document.page(at: pageIndex) else { continue }
             
             let pageSignatures = page.annotations.compactMap { annotation -> SignatureModel? in
+                // ✅ Ensure annotation is editable when loading
+                if let stamp = annotation as? ImageStampAnnotation {
+                    stamp.isReadOnly = false  // ✅ Make editable on load
+                } else {
+                    annotation.isReadOnly = false  // ✅ Make editable on load
+                }
                 return SignatureModel.fromAnnotation(annotation, page: page)
             }
             
@@ -568,10 +650,17 @@ class PDFSignatureEditorController: UIViewController {
         let pageSignatures = signatures[currentPageIndex] ?? []
         
         // Check from top to bottom (reverse order) to get the topmost signature
+        // Use improved hit-testing that accounts for rotation
         for signature in pageSignatures.reversed() {
-            // Check if tap is within signature bounds (using normalized coordinates)
             let pdfRect = signature.pdfRect(for: page)
-            if pdfRect.contains(pdfPoint) {
+            let center = CGPoint(x: pdfRect.midX, y: pdfRect.midY)
+            
+            // Use distance-to-center bounding circle for better hit-testing with rotation
+            let dx = pdfPoint.x - center.x
+            let dy = pdfPoint.y - center.y
+            let radius = hypot(pdfRect.width, pdfRect.height) / 2
+            
+            if hypot(dx, dy) <= radius {
                 activeSignatureID = signature.id
                 activeSignatureIDSubject.send(activeSignatureID)
                 renderSignatureOverlays()
@@ -597,19 +686,27 @@ class PDFSignatureEditorController: UIViewController {
         switch gesture.state {
         case .began:
             gestureStartSignatureID = activeID
+            gestureStartCenter = signature.center
             gestureStartRect = signature.pdfRect(for: page)
             registerUndoSnapshot(for: currentPageIndex)
             
         case .changed:
-            guard let startRect = gestureStartRect else { return }
+            guard let startCenter = gestureStartCenter else { return }
             
-            // Calculate delta in normalized coordinates
-            let deltaX = (pdfPoint.x - startRect.midX) / pageBounds.width
-            let deltaY = (pdfPoint.y - startRect.midY) / pageBounds.height
+            // Calculate delta from start center (prevents drift)
+            let startPDFCenter = CGPoint(
+                x: startCenter.x * pageBounds.width,
+                y: startCenter.y * pageBounds.height
+            )
             
-            // Update normalized center
-            signature.center.x += deltaX
-            signature.center.y += deltaY
+            let dx = (pdfPoint.x - startPDFCenter.x) / pageBounds.width
+            let dy = (pdfPoint.y - startPDFCenter.y) / pageBounds.height
+            
+            // Update normalized center from start position
+            signature.center = CGPoint(
+                x: startCenter.x + dx,
+                y: startCenter.y + dy
+            )
             
             // Clamp to valid range
             signature.center.x = max(0.05, min(0.95, signature.center.x))
@@ -620,15 +717,28 @@ class PDFSignatureEditorController: UIViewController {
                 if let index = pageSignatures.firstIndex(where: { $0.id == activeID }) {
                     pageSignatures[index] = signature
                     signatures[currentPageIndex] = pageSignatures
+                    
+                    // If committed, update annotation bounds directly (no remove/add)
+                    if signature.isCommitted,
+                       let existing = findAnnotation(for: activeID, page: page) as? ImageStampAnnotation {
+                        updateAnnotationBounds(existing, for: signature, page: page)
+                    }
                 }
             }
             
+            // Only render overlays (uncommitted signatures), not full PDF redraw
             renderSignatureOverlays()
             
         case .ended, .cancelled:
+            if signature.isCommitted {
+                upsertAnnotation(for: signature, on: page)
+            }
+            
             gestureStartSignatureID = nil
+            gestureStartCenter = nil
             gestureStartRect = nil
             hasPendingChangesSubject.send(true)
+            renderSignatureOverlays()
             
         default:
             break
@@ -660,6 +770,12 @@ class PDFSignatureEditorController: UIViewController {
                 if let index = pageSignatures.firstIndex(where: { $0.id == activeID }) {
                     pageSignatures[index] = signature
                     signatures[currentPageIndex] = pageSignatures
+                    
+                    // If committed, update annotation immediately
+                    if signature.isCommitted,
+                       let page = pdfDocument?.page(at: currentPageIndex) {
+                        upsertAnnotation(for: signature, on: page)
+                    }
                 }
             }
             
@@ -695,6 +811,12 @@ class PDFSignatureEditorController: UIViewController {
                 if let index = pageSignatures.firstIndex(where: { $0.id == activeID }) {
                     pageSignatures[index] = signature
                     signatures[currentPageIndex] = pageSignatures
+                    
+                    // If committed, update annotation immediately
+                    if signature.isCommitted,
+                       let page = pdfDocument?.page(at: currentPageIndex) {
+                        upsertAnnotation(for: signature, on: page)
+                    }
                 }
             }
             
@@ -833,43 +955,38 @@ extension PDFSignatureEditorController: UIGestureRecognizerDelegate {
             isMovingSignature = true
         }
         
-        // CRITICAL FIX: Convert screen delta to PDF delta using coordinate converter
+        // Convert screen delta to normalized delta using scaleFactor + flipY
         let pageBounds = page.bounds(for: .mediaBox)
+        let scale = pdfView.scaleFactor
         
-        // Convert screen delta to PDF delta
-        // Use PDFCoordinateConverter to properly handle coordinate conversion
-        let screenPoint1 = CGPoint(x: 0, y: 0)
-        let screenPoint2 = CGPoint(x: screenDelta.width, y: screenDelta.height)
-        
-        let pdfPoint1 = PDFCoordinateConverter.viewToPDF(screenPoint1, page: page, pdfView: pdfView)
-        let pdfPoint2 = PDFCoordinateConverter.viewToPDF(screenPoint2, page: page, pdfView: pdfView)
-        
-        // Calculate PDF delta
-        let pdfDeltaX = pdfPoint2.x - pdfPoint1.x
-        let pdfDeltaY = pdfPoint2.y - pdfPoint1.y
-        
-        // Convert PDF delta to normalized delta
-        let normalizedDX = pdfDeltaX / pageBounds.width
-        let normalizedDY = pdfDeltaY / pageBounds.height
+        let normalizedDX = screenDelta.width / (pageBounds.width * scale)
+        let normalizedDY = -screenDelta.height / (pageBounds.height * scale) // flip Y
         
         // Update normalized center
-        signature.center.x += normalizedDX
-        signature.center.y += normalizedDY
-        
-        // Clamp to 0...1
-        signature.center.x = max(0.05, min(0.95, signature.center.x))
-        signature.center.y = max(0.05, min(0.95, signature.center.y))
+        signature.center.x = max(0.05, min(0.95, signature.center.x + normalizedDX))
+        signature.center.y = max(0.05, min(0.95, signature.center.y + normalizedDY))
         
         // Update in array
-        if var pageSignatures = signatures[currentPageIndex] {
-            if let index = pageSignatures.firstIndex(where: { $0.id == activeID }) {
-                pageSignatures[index] = signature
-                signatures[currentPageIndex] = pageSignatures
+        if var pageSignatures = signatures[currentPageIndex],
+           let idx = pageSignatures.firstIndex(where: { $0.id == activeID }) {
+            pageSignatures[idx] = signature
+            signatures[currentPageIndex] = pageSignatures
+            
+            // If committed, update annotation live
+            if signature.isCommitted,
+               let existing = findAnnotation(for: activeID, page: page) as? ImageStampAnnotation {
+                updateAnnotationBounds(existing, for: signature, page: page)
+                existing.originalRotation = signature.rotation
+                existing.originalColor = signature.color
+                existing.originalWidthRatio = signature.widthRatio
+                existing.originalAspectRatio = signature.aspectRatio
+                existing.updatePayloadIfNeeded()
+                pdfView.setNeedsDisplay()
             }
         }
         
         hasPendingChangesSubject.send(true)
-        renderSignatureOverlays() // Refresh display
+        renderSignatureOverlays()
     }
     
     func endMoveSignature() {
@@ -890,7 +1007,8 @@ extension PDFSignatureEditorController: UIGestureRecognizerDelegate {
     /// Resize active signature by scale factor
     func resizeActiveSignature(by scaleFactor: CGFloat) {
         guard let activeID = activeSignatureID,
-              var signature = getSignature(id: activeID, pageIndex: currentPageIndex) else { return }
+              var signature = getSignature(id: activeID, pageIndex: currentPageIndex),
+              let page = pdfDocument?.page(at: currentPageIndex) else { return }
         
         // Register undo snapshot on first resize
         if !isResizingSignature {
@@ -907,6 +1025,22 @@ extension PDFSignatureEditorController: UIGestureRecognizerDelegate {
             if let index = pageSignatures.firstIndex(where: { $0.id == activeID }) {
                 pageSignatures[index] = signature
                 signatures[currentPageIndex] = pageSignatures
+                
+                // ✅ If committed, update annotation with remove/add invalidation
+                if signature.isCommitted,
+                   let existing = findAnnotation(for: activeID, page: page) as? ImageStampAnnotation {
+                    // Update bounds and metadata
+                    updateAnnotationBounds(existing, for: signature, page: page)
+                    existing.originalRotation = signature.rotation
+                    existing.originalColor = signature.color
+                    existing.originalAspectRatio = signature.aspectRatio
+                    existing.originalWidthRatio = signature.widthRatio
+                    existing.updatePayloadIfNeeded()
+                    
+                    // ✅ Remove/add to force PDFKit refresh (prevents caching issues)
+                    page.removeAnnotation(existing)
+                    page.addAnnotation(existing)
+                }
             }
         }
         
@@ -917,7 +1051,8 @@ extension PDFSignatureEditorController: UIGestureRecognizerDelegate {
     /// Rotate active signature by angle (degrees)
     func rotateActiveSignature(by angle: CGFloat) {
         guard let activeID = activeSignatureID,
-              var signature = getSignature(id: activeID, pageIndex: currentPageIndex) else { return }
+              var signature = getSignature(id: activeID, pageIndex: currentPageIndex),
+              let page = pdfDocument?.page(at: currentPageIndex) else { return }
         
         // Register undo snapshot on first rotate
         if !isRotatingSignature {
@@ -932,6 +1067,22 @@ extension PDFSignatureEditorController: UIGestureRecognizerDelegate {
             if let index = pageSignatures.firstIndex(where: { $0.id == activeID }) {
                 pageSignatures[index] = signature
                 signatures[currentPageIndex] = pageSignatures
+                
+                // ✅ If committed, update annotation with remove/add invalidation
+                if signature.isCommitted,
+                   let existing = findAnnotation(for: activeID, page: page) as? ImageStampAnnotation {
+                    // Update bounds and metadata
+                    updateAnnotationBounds(existing, for: signature, page: page)
+                    existing.originalRotation = signature.rotation
+                    existing.originalColor = signature.color
+                    existing.originalAspectRatio = signature.aspectRatio
+                    existing.originalWidthRatio = signature.widthRatio
+                    existing.updatePayloadIfNeeded()
+                    
+                    // ✅ Remove/add to force PDFKit refresh (prevents bouncing/jumping)
+                    page.removeAnnotation(existing)
+                    page.addAnnotation(existing)
+                }
             }
         }
         
@@ -982,29 +1133,24 @@ extension PDFSignatureEditorController: UIGestureRecognizerDelegate {
         
         // Create image layer
         let imageLayer = CALayer()
-        imageLayer.frame = screenRect
+        // Set bounds, position, and anchor point for proper rotation
+        imageLayer.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+        imageLayer.position = CGPoint(x: screenRect.midX, y: screenRect.midY)
+        imageLayer.bounds = CGRect(x: 0, y: 0, width: screenRect.width, height: screenRect.height)
+        // Don't set frame when using position+bounds
+        imageLayer.contentsScale = UIScreen.main.scale
         imageLayer.contents = tintedImage.cgImage
         imageLayer.contentsGravity = .resizeAspect
         
-        // Apply rotation (convert to radians)
+        // ✅ Apply rotation + Y-flip to match PDF coordinate system
+        // PDF uses bottom-left origin (Y-up), CALayer uses top-left (Y-down)
         let rotationRadians = signature.rotation * .pi / 180.0
-        imageLayer.transform = CATransform3DMakeRotation(rotationRadians, 0, 0, 1)
+        var transform = CATransform3DIdentity
+        transform = CATransform3DRotate(transform, rotationRadians, 0, 0, 1)
+        transform = CATransform3DScale(transform, 1, -1, 1) // Flip Y to match PDF
+        imageLayer.transform = transform
         
-        // Add selection indicator if active
-        if signature.id == activeSignatureID {
-            let selectionLayer = CAShapeLayer()
-            selectionLayer.frame = screenRect
-            
-            let path = UIBezierPath(rect: CGRect(x: 0, y: 0, width: screenRect.width, height: screenRect.height))
-            selectionLayer.path = path.cgPath
-            selectionLayer.strokeColor = UIColor.systemYellow.cgColor
-            selectionLayer.fillColor = UIColor.clear.cgColor
-            selectionLayer.lineWidth = 2.0
-            selectionLayer.lineDashPattern = [5, 3]
-            
-            overlayLayer?.addSublayer(selectionLayer)
-        }
-        
+        // Selection UI is handled by SwiftUI SelectionBoxView - no CALayer selection indicator needed
         overlayLayer?.addSublayer(imageLayer)
     }
     
@@ -1017,6 +1163,40 @@ extension PDFSignatureEditorController: UIGestureRecognizerDelegate {
             context.cgContext.fill(CGRect(origin: .zero, size: size))
             context.cgContext.setBlendMode(.destinationIn)
             context.cgContext.draw(cgImage, in: CGRect(origin: .zero, size: size))
+        }
+    }
+    
+    // MARK: - Visual Filter (Preview Only)
+    
+    /// Apply a visual filter to the PDFView display layer (non-destructive preview)
+    /// This does NOT modify the PDF document or annotations
+    func setVisualFilter(_ filterType: FilterType) {
+        switch filterType {
+        case .color:
+            // No filter - show original
+            pdfView.layer.filters = nil
+            
+        case .grayscale:
+            // Desaturate to grayscale
+            if let filter = CIFilter(name: "CIColorControls") {
+                filter.setDefaults()
+                filter.setValue(0.0, forKey: kCIInputSaturationKey)
+                pdfView.layer.filters = [filter]
+            } else {
+                pdfView.layer.filters = nil
+            }
+            
+        case .blackAndWhite:
+            // High contrast black and white
+            if let filter = CIFilter(name: "CIColorControls") {
+                filter.setDefaults()
+                filter.setValue(0.0, forKey: kCIInputSaturationKey)  // Remove color
+                filter.setValue(1.8, forKey: kCIInputContrastKey)     // High contrast
+                filter.setValue(0.1, forKey: kCIInputBrightnessKey)    // Slight brightness boost
+                pdfView.layer.filters = [filter]
+            } else {
+                pdfView.layer.filters = nil
+            }
         }
     }
 }

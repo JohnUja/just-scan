@@ -140,36 +140,36 @@ class DocumentService: ObservableObject {
     
     private func applyFilter(to image: UIImage, filterType: FilterType) -> UIImage {
         guard let cgImage = image.cgImage else { return image }
-        
-        let context = CIContext(options: nil)
+
+        let context = CIContext(options: [.useSoftwareRenderer: false])
         let ciImage = CIImage(cgImage: cgImage)
-        
-        let filter: CIFilter?
-        
+
+        let filteredCIImage: CIImage
+
         switch filterType {
         case .blackAndWhite:
-            // High contrast black and white
-            filter = CIFilter(name: "CIColorControls")
-            filter?.setValue(ciImage, forKey: kCIInputImageKey)
-            filter?.setValue(1.5, forKey: kCIInputContrastKey) // High contrast
-            filter?.setValue(0.0, forKey: kCIInputSaturationKey) // Remove color
-            
+            guard let controls = CIFilter(name: "CIColorControls") else { return image }
+            controls.setValue(ciImage, forKey: kCIInputImageKey)
+            controls.setValue(1.8, forKey: kCIInputContrastKey)
+            controls.setValue(0.0, forKey: kCIInputSaturationKey)
+            controls.setValue(0.1, forKey: kCIInputBrightnessKey)
+            filteredCIImage = controls.outputImage ?? ciImage
+
         case .grayscale:
-            filter = CIFilter(name: "CIColorControls")
-            filter?.setValue(ciImage, forKey: kCIInputImageKey)
-            filter?.setValue(0.0, forKey: kCIInputSaturationKey) // Remove color
-            
+            guard let controls = CIFilter(name: "CIColorControls") else { return image }
+            controls.setValue(ciImage, forKey: kCIInputImageKey)
+            controls.setValue(0.0, forKey: kCIInputSaturationKey)
+            controls.setValue(1.1, forKey: kCIInputContrastKey)
+            filteredCIImage = controls.outputImage ?? ciImage
+
         case .color:
             return image
         }
-        
-        guard let filter = filter,
-              let outputImage = filter.outputImage,
-              let cgImage = context.createCGImage(outputImage, from: outputImage.extent) else {
+
+        guard let outputCGImage = context.createCGImage(filteredCIImage, from: filteredCIImage.extent) else {
             return image
         }
-        
-        return UIImage(cgImage: cgImage)
+        return UIImage(cgImage: outputCGImage)
     }
 
     // MARK: - Flatten and Compress
@@ -232,90 +232,6 @@ enum DocumentError: LocalizedError {
             return "A document with this name already exists"
         }
     }
-}
-// ✅ ACTUALLY APPLY FILTERS TO PDF
-
-func applyFilter(to pdfDocument: PDFDocument, filterType: FilterType) -> PDFDocument {
-    guard filterType != .color else {
-        return pdfDocument // No processing for color
-    }
-    
-    let filteredPDF = PDFDocument()
-    
-    for pageIndex in 0..<pdfDocument.pageCount {
-        guard let page = pdfDocument.page(at: pageIndex) else { continue }
-        
-        let pageRect = page.bounds(for: .mediaBox)
-        
-        // ✅ High-resolution rendering (3x scale for quality)
-        let scale: CGFloat = 3.0
-        let renderSize = CGSize(width: pageRect.width * scale, height: pageRect.height * scale)
-        
-        let renderer = UIGraphicsImageRenderer(size: renderSize)
-        
-        let image = renderer.image { context in
-            // White background to avoid transparency issues
-            context.cgContext.setFillColor(UIColor.white.cgColor)
-            context.cgContext.fill(CGRect(origin: .zero, size: renderSize))
-            
-            context.cgContext.translateBy(x: 0, y: renderSize.height)
-            context.cgContext.scaleBy(x: scale, y: -scale)
-            page.draw(with: .mediaBox, to: context.cgContext)
-        }
-        
-        let filteredImage = applyImageFilter(to: image, filterType: filterType)
-        
-        if let filteredPage = PDFPage(image: filteredImage) {
-            filteredPDF.insert(filteredPage, at: filteredPDF.pageCount)
-        }
-    }
-    
-    return filteredPDF
-}
-
-// ✅ Enhanced filter implementation
-private func applyImageFilter(to image: UIImage, filterType: FilterType) -> UIImage {
-    guard let cgImage = image.cgImage else { return image }
-    
-    let context = CIContext(options: [.useSoftwareRenderer: false])
-    let ciImage = CIImage(cgImage: cgImage)
-    
-    let filteredCIImage: CIImage
-    
-    switch filterType {
-    case .blackAndWhite:
-        // High contrast B&W for document scanning
-        guard let contrastFilter = CIFilter(name: "CIColorControls") else { return image }
-        contrastFilter.setValue(ciImage, forKey: kCIInputImageKey)
-        contrastFilter.setValue(1.8, forKey: kCIInputContrastKey) // High contrast
-        contrastFilter.setValue(0.0, forKey: kCIInputSaturationKey) // Remove color
-        contrastFilter.setValue(0.1, forKey: kCIInputBrightnessKey) // Slight brightness boost
-        
-        guard let bwImage = contrastFilter.outputImage,
-              let thresholdFilter = CIFilter(name: "CIColorThreshold") else { return image }
-        
-        thresholdFilter.setValue(bwImage, forKey: kCIInputImageKey)
-        thresholdFilter.setValue(0.5, forKey: "inputThreshold")
-        
-        filteredCIImage = thresholdFilter.outputImage ?? bwImage
-        
-    case .grayscale:
-        guard let filter = CIFilter(name: "CIColorControls") else { return image }
-        filter.setValue(ciImage, forKey: kCIInputImageKey)
-        filter.setValue(0.0, forKey: kCIInputSaturationKey)
-        filter.setValue(1.1, forKey: kCIInputContrastKey) // Slight contrast boost
-        
-        filteredCIImage = filter.outputImage ?? ciImage
-        
-    case .color:
-        return image
-    }
-    
-    guard let outputCGImage = context.createCGImage(filteredCIImage, from: filteredCIImage.extent) else {
-        return image
-    }
-    
-    return UIImage(cgImage: outputCGImage)
 }
 
 

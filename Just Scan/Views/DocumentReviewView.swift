@@ -176,7 +176,7 @@ struct DocumentReviewView: View {
                         editorProxy.commitAllToPDF()
                         _ = editorProxy.saveToDisk(url: document.fileURL)
                         // Clear selection and reset nav state after save
-                        activeSignatureID = nil
+                        editorProxy.selectSignature(nil)
                         hasPendingChanges = false
                         dismiss()
                     }
@@ -246,7 +246,7 @@ struct DocumentReviewView: View {
                             hasPendingChanges: $hasPendingChanges,
                             controllerProxy: editorProxy,
                             onPageChange: { newIndex in
-                                activeSignatureID = nil
+                                editorProxy.selectSignature(nil)
                                 currentPageIndex = newIndex
                             },
                             onSignatureChange: { newSignatures in
@@ -255,9 +255,10 @@ struct DocumentReviewView: View {
                         )
                         .shadow(color: .black.opacity(0.15), radius: 10, y: 5)
                         
-                        // FIXED: Signature Overlays with proper coordinate space
-                        // Use the geometry size as reference for screen space
-                        signatureOverlays(in: geometry.size)
+                        // REMOVED: SwiftUI signature overlays - UIKit controller handles all rendering
+                        // This prevents double-rendering (ghost copies)
+                        // UIKit's renderSignatureOverlays() handles uncommitted signatures
+                        // PDF annotations handle committed signatures
                         
                         // FIXED: Selection Box and Toolbar
                         if let activeID = activeSignatureID,
@@ -270,10 +271,17 @@ struct DocumentReviewView: View {
                                 
                                 let rectCenter = CGPoint(x: screenRect.midX, y: screenRect.midY)
                                 
-                                // Floating Toolbar
+                                // ✅ Toolbar positioned relative to signature size (scales with signature)
+                                let toolbarOffset = max(50, screenRect.height * 0.3) // At least 50pt, or 30% of signature height
                                 FloatingToolbarView(
-                                    position: CGPoint(x: rectCenter.x, y: screenRect.minY - 60),
-                                    onMove: {},
+                                    position: CGPoint(x: rectCenter.x, y: screenRect.minY - toolbarOffset),
+                                    onMove: { delta in
+                                        // ✅ Move icon drag moves signature and toolbar together
+                                        editorProxy.moveActiveSignature(by: delta)
+                                    },
+                                    onMoveEnd: {
+                                        editorProxy.endMoveSignature()
+                                    },
                                     onColor: { showColorPicker = true },
                                     onDelete: { editorProxy.deleteActiveSignature() },
                                     onDuplicate: { editorProxy.duplicateActiveSignature() },
@@ -297,6 +305,15 @@ struct DocumentReviewView: View {
                                     },
                                     onRotate: { angle in
                                         editorProxy.rotateActiveSignature(by: angle)
+                                    },
+                                    onMoveEnd: {
+                                        editorProxy.endMoveSignature()
+                                    },
+                                    onResizeEnd: {
+                                        editorProxy.endResizeSignature()
+                                    },
+                                    onRotateEnd: {
+                                        editorProxy.endRotateSignature()
                                     }
                                 )
                                 .zIndex(1000)
@@ -313,53 +330,10 @@ struct DocumentReviewView: View {
         }
     }
     
-    // MARK: - FIXED Signature Overlays
-    
-    @ViewBuilder
-    private func signatureOverlays(in containerSize: CGSize) -> some View {
-        if let pageSignatures = signatures[currentPageIndex] {
-            ForEach(pageSignatures) { signature in
-                signatureOverlay(for: signature, in: containerSize)
-            }
-        }
-    }
-                            
-    @ViewBuilder
-    private func signatureOverlay(for signature: SignatureModel, in containerSize: CGSize) -> some View {
-        // CRITICAL: Get screen rect from controller (handles all coordinate conversion)
-        if let screenRect = editorProxy.getSignatureScreenRect(signatureID: signature.id, pageIndex: currentPageIndex),
-           let image = getSignatureImage(for: signature),
-           screenRect.width > 0 && screenRect.height > 0 {
-            
-            let isActive = activeSignatureID == signature.id
-            
-            // CRITICAL: Use screenRect directly - it's already in the correct coordinate space
-            let center = CGPoint(x: screenRect.midX, y: screenRect.midY)
-            
-            // Get the aspect ratio from the signature model
-            let aspectRatio = signature.aspectRatio > 0 ? signature.aspectRatio : (image.size.width / image.size.height)
-        
-        ZStack {
-                // Apply color tint to image
-                Image(uiImage: applyColor(to: image, color: signature.color.uiColor))
-                    .resizable()
-                    .aspectRatio(aspectRatio, contentMode: .fit)
-                    .frame(width: abs(screenRect.width), height: abs(screenRect.height))
-                    .rotationEffect(.degrees(signature.rotation))
-                    .allowsHitTesting(false) // Image doesn't intercept touches
-            }
-            .frame(width: screenRect.width + 40, height: screenRect.height + 40) // Larger tap area
-            .position(center) // Position the tap area
-            .contentShape(Rectangle())
-            .allowsHitTesting(!isActive) // Only inactive signatures are tappable
-            .onTapGesture {
-                activeSignatureID = signature.id
-                UISelectionFeedbackGenerator().selectionChanged()
-            }
-            .zIndex(isActive ? 1000 : 0)
-            .id("signature-overlay-\(signature.id.uuidString)-\(currentPageIndex)")
-        }
-    }
+    // MARK: - REMOVED: SwiftUI Signature Overlays
+    // UIKit controller handles all signature rendering via CALayer overlays
+    // This prevents double-rendering and gesture conflicts
+    // SwiftUI only displays toolbars and selection boxes based on activeSignatureID
     
     // REMOVED: All manual coordinate conversion and duplicate signature management functions
     // Now using editorProxy methods which use PDFCoordinateConverter properly
@@ -416,7 +390,7 @@ struct DocumentReviewView: View {
                     editorProxy.commitAllToPDF()
                     _ = editorProxy.saveToDisk(url: document.fileURL)
                     // Clear selection and reset nav state after save
-                    activeSignatureID = nil
+                    editorProxy.selectSignature(nil)
                     hasPendingChanges = false
                         }
                         .fontWeight(.semibold)
@@ -428,7 +402,8 @@ struct DocumentReviewView: View {
                 } else {
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button("Done") {
-                    editorProxy.commitAllToPDF()
+                        editorProxy.commitAllToPDF()
+                        _ = editorProxy.saveToDisk(url: document.fileURL)  // ✅ Persist annotations before dismiss
                         dismiss()
                     }
                 }
@@ -548,17 +523,10 @@ struct DocumentReviewView: View {
     }
     
     private func applyFilter(_ filterType: FilterType) {
-        guard let pdfDoc = pdfDocument else { return }
+        // ✅ Visual-only filter preview (non-destructive)
+        // Filter is only baked into PDF on export/share
             selectedFilter = filterType
-        
-        let documentService = DocumentService.shared
-        let filteredPDF = documentService.applyFilter(to: pdfDoc, filterType: filterType)
-        
-        // Save filtered PDF
-        if let fileURL = document.fileURL as URL? {
-            _ = filteredPDF.write(to: fileURL)
-            loadPDF() // Reload to show filtered version
-        }
+        editorProxy.setVisualFilter(filterType)  // Apply visual filter to PDFView layer
     }
     
     private func secureAndShare() {
@@ -615,11 +583,21 @@ struct DocumentReviewView: View {
         guard let pdfDoc = pdfDocument else { return }
         
         let documentService = DocumentService.shared
-        guard let flattenedPDF = documentService.flattenAndCompress(pdfDocument: pdfDoc) else {
+        
+        // 1) First flatten (signatures become non-editable, smaller)
+        guard let flattened = documentService.flattenAndCompress(pdfDocument: pdfDoc) else {
             return
         }
         
-        sharePDF(flattenedPDF)
+        // 2) Then apply filter to flattened export ONLY (if not color)
+        let exportDoc: PDFDocument
+        if selectedFilter == .color {
+            exportDoc = flattened
+        } else {
+            exportDoc = documentService.applyFilter(to: flattened, filterType: selectedFilter)
+        }
+        
+        sharePDF(exportDoc)
     }
     
     private func sharePDF(_ pdfDocument: PDFDocument) {

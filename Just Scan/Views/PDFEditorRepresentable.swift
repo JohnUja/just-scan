@@ -32,7 +32,7 @@ struct PDFEditorRepresentable: UIViewControllerRepresentable {
         
         // Store controller in proxy if provided
         controllerProxy?.controller = controller
-        controllerProxy?.setupSubscriptions(controller: controller)
+        controllerProxy?.bind(to: controller)
         
         // Subscribe to Combine publishers
         context.coordinator.setupSubscriptions(controller: controller)
@@ -41,16 +41,7 @@ struct PDFEditorRepresentable: UIViewControllerRepresentable {
     }
     
     func updateUIViewController(_ uiViewController: PDFSignatureEditorController, context: Context) {
-        // Update document if it changed (compare by URL)
-        let currentDocURL = uiViewController.pdfDocument?.documentURL
-        let newDocURL = pdfDocument.documentURL
-        if currentDocURL != newDocURL {
-            uiViewController.loadDocument(pdfDocument)
-        }
-        
-        // Sync page index
-        // Note: updateUIViewController is called on main thread by SwiftUI
-        // We need to access @MainActor properties, so use Task
+        // Page sync only - avoid unnecessary document reloads
         let targetPageIndex = currentPageIndex
         Task { @MainActor in
             if uiViewController.currentPageIndex != targetPageIndex {
@@ -107,6 +98,9 @@ struct PDFEditorRepresentable: UIViewControllerRepresentable {
         
         @MainActor
         func setupSubscriptions(controller: PDFSignatureEditorController) {
+            // Prevent duplicate subscriptions
+            cancellables.removeAll()
+            
             // Subscribe to signatures changes
             controller.signaturesSubject
                 .receive(on: DispatchQueue.main)

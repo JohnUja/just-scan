@@ -97,40 +97,126 @@ struct SignatureModel: Identifiable, Equatable {
     // MARK: - Loading from Annotation
     
     static func fromAnnotation(_ annotation: PDFAnnotation, page: PDFPage) -> SignatureModel? {
-        // Only load annotations marked as JustScan signatures
-        guard let name = annotation.value(forAnnotationKey: .name) as? String,
-              name == "JustScanSignature_v1" else {
-            return nil
+        // CRITICAL: Check if this is our signature annotation (multiple ways for reliability)
+        let name = annotation.value(forAnnotationKey: .name) as? String
+        let contents = annotation.contents ?? ""
+        
+        let isOurs =
+            (name == SignatureAnnotationKeys.annotationName) ||
+            contents.hasPrefix(SignatureAnnotationKeys.payloadPrefix) ||
+            contents.contains("imageDataB64")
+        
+        guard isOurs else { return nil }
+        
+        // 1) Signature ID from userName (stable!)
+        let sigIDString = annotation.userName ?? ""
+        guard !sigIDString.isEmpty,
+              let sigUUID = UUID(uuidString: sigIDString) else { return nil }
+        
+        // 2) Parse payload with fallback support for old format
+        var payload: SignatureAnnotationPayload?
+        var legacyMetadata: LegacySignatureMetadata?
+        
+        if let contents = annotation.contents {
+            if contents.hasPrefix(SignatureAnnotationKeys.payloadPrefix) {
+                // New format: parse payload
+                let json = String(contents.dropFirst(SignatureAnnotationKeys.payloadPrefix.count))
+                if let data = json.data(using: .utf8) {
+                    payload = try? JSONDecoder().decode(SignatureAnnotationPayload.self, from: data)
+                }
+            } else if contents.contains("imageDataB64") {
+                // Legacy format: parse old metadata
+                if let data = contents.data(using: .utf8),
+                   let _ = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    legacyMetadata = try? JSONDecoder().decode(LegacySignatureMetadata.self, from: data)
+                }
+            }
         }
         
-        guard let stamp = annotation as? ImageStampAnnotation else {
-            return nil
-        }
-        
+        // 3) Extract properties with fallback chain
         let pageBounds = page.bounds(for: .mediaBox)
         let bounds = annotation.bounds
         
-        // Use stored properties from annotation
         let normalizedCenter = CGPoint(
             x: bounds.midX / pageBounds.width,
             y: bounds.midY / pageBounds.height
         )
         
-        let widthRatio = stamp.originalWidthRatio
+        // Rotation: payload -> legacy -> annotation property (if ImageStampAnnotation)
+        let rotation: CGFloat
+        if let r = payload?.rotation {
+            rotation = r
+        } else if let r = legacyMetadata?.rotation {
+            rotation = r
+        } else if let stamp = annotation as? ImageStampAnnotation {
+            rotation = stamp.originalRotation
+        } else {
+            rotation = 0  // Fallback
+        }
         
-        // Get image ID from annotation (would need to be stored)
-        // For now, use a placeholder
-        let imageID = UUID().uuidString
+        // Color: payload -> legacy -> annotation property
+        let color: SignatureColor
+        if let c = payload?.color, let col = SignatureColor(rawValue: c) {
+            color = col
+        } else if let c = legacyMetadata?.color, let col = SignatureColor(rawValue: c) {
+            color = col
+        } else if let stamp = annotation as? ImageStampAnnotation {
+            color = stamp.originalColor
+        } else {
+            color = .black  // Fallback
+        }
+        
+        // Aspect ratio: payload -> legacy -> annotation property
+        let aspect: CGFloat
+        if let a = payload?.aspectRatio {
+            aspect = a
+        } else if let a = legacyMetadata?.aspectRatio {
+            aspect = a
+        } else if let stamp = annotation as? ImageStampAnnotation {
+            aspect = stamp.originalAspectRatio
+        } else {
+            // Calculate from bounds if available
+            aspect = bounds.height > 0 ? bounds.width / bounds.height : 2.0
+        }
+        
+        // Width ratio: payload -> legacy -> annotation property
+        let widthRatio: CGFloat
+        if let w = payload?.widthRatio {
+            widthRatio = w
+        } else if let w = legacyMetadata?.widthRatio {
+            widthRatio = w
+        } else if let stamp = annotation as? ImageStampAnnotation {
+            widthRatio = stamp.originalWidthRatio
+        } else {
+            // Calculate from bounds
+            widthRatio = pageBounds.width > 0 ? bounds.width / pageBounds.width : 0.2
+        }
+        
+        // Image ID: payload -> annotation property -> generate from imageData
+        let imageID: String
+        if let id = payload?.imageID, !id.isEmpty {
+            imageID = id
+        } else if let stamp = annotation as? ImageStampAnnotation, !stamp.imageID.isEmpty {
+            imageID = stamp.imageID
+        } else if let b64 = payload?.imageDataB64 ?? legacyMetadata?.imageDataB64,
+                  let data = Data(base64Encoded: b64) {
+            // Generate stable ID from image data (deterministic)
+            imageID = "img_" + String(data.hashValue)
+        } else {
+            // Last resort: generate new ID (shouldn't happen)
+            imageID = UUID().uuidString
+        }
         
         return SignatureModel(
+            id: sigUUID,
             center: normalizedCenter,
             widthRatio: widthRatio,
-            rotation: stamp.originalRotation,
-            color: stamp.originalColor,
+            rotation: rotation,
+            color: color,
             imageID: imageID,
-            aspectRatio: stamp.originalAspectRatio,
+            aspectRatio: aspect,
             isCommitted: true,
-            annotationID: annotation.userName
+            annotationID: sigIDString
         )
     }
     
