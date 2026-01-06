@@ -37,11 +37,19 @@ struct PDFEditorRepresentable: UIViewControllerRepresentable {
         // Subscribe to Combine publishers
         context.coordinator.setupSubscriptions(controller: controller)
         
+        // ✅ CRITICAL: Sync initial state after subscriptions are set up
+        // This ensures SwiftUI receives signatures loaded by loadDocument()
+        DispatchQueue.main.async {
+            context.coordinator.syncInitialState(from: controller)
+        }
+        
         return controller
     }
     
     func updateUIViewController(_ uiViewController: PDFSignatureEditorController, context: Context) {
         // Page sync only - avoid unnecessary document reloads
+        // CRITICAL: Don't sync activeSignatureID here - it causes selection to be cleared
+        // The Combine subject already handles activeSignatureID updates
         let targetPageIndex = currentPageIndex
         Task { @MainActor in
             if uiViewController.currentPageIndex != targetPageIndex {
@@ -79,6 +87,7 @@ struct PDFEditorRepresentable: UIViewControllerRepresentable {
         weak var controller: PDFSignatureEditorController?
         
         private var cancellables = Set<AnyCancellable>()
+        private var hasSyncedInitialState = false  // Prevent multiple syncs
         
         init(
             signatures: Binding<[Int: [SignatureModel]]>,
@@ -123,7 +132,14 @@ struct PDFEditorRepresentable: UIViewControllerRepresentable {
             controller.activeSignatureIDSubject
                 .receive(on: DispatchQueue.main)
                 .sink { [weak self] newID in
+                    // #region agent log
+                    DebugLogger.shared.logStateChange("activeSignatureID (Combine)", oldValue: nil, newValue: newID?.uuidString, hypothesisId: "A")
+                    // #endregion
                     self?.activeSignatureID = newID
+                    // Force SwiftUI update by triggering a small delay
+                    DispatchQueue.main.async {
+                        // This ensures SwiftUI processes the binding change
+                    }
                 }
                 .store(in: &cancellables)
             
@@ -134,6 +150,50 @@ struct PDFEditorRepresentable: UIViewControllerRepresentable {
                     self?.hasPendingChanges = hasChanges
                 }
                 .store(in: &cancellables)
+        }
+        
+        /// Sync initial state from controller to SwiftUI bindings
+        /// Called after subscriptions are set up to ensure initial state is synced
+        /// CRITICAL: Only called once on initial setup, not on every update
+        @MainActor
+        func syncInitialState(from controller: PDFSignatureEditorController) {
+            // Prevent multiple syncs - only sync once on initial setup
+            guard !hasSyncedInitialState else {
+                // #region agent log
+                DebugLogger.shared.log(
+                    location: "PDFEditorRepresentable.swift:syncInitialState",
+                    message: "Skipping sync - already synced",
+                    data: [:],
+                    hypothesisId: "B"
+                )
+                // #endregion
+                return
+            }
+            hasSyncedInitialState = true
+            
+            let state = controller.currentState
+            // Sync all state
+            signatures = state.signatures
+            // CRITICAL: Only sync activeSignatureID if it's not already set (avoid clearing user selection)
+            // On initial sync, it should be nil, so we can safely set it
+            if activeSignatureID == nil {
+                activeSignatureID = state.activeSignatureID
+            }
+            currentPageIndex = state.currentPageIndex
+            hasPendingChanges = state.hasPendingChanges
+            // #region agent log
+            DebugLogger.shared.log(
+                location: "PDFEditorRepresentable.swift:syncInitialState",
+                message: "Synced initial state",
+                data: [
+                    "signatureCount": state.signatures.values.reduce(0) { $0 + $1.count },
+                    "activeSignatureID": state.activeSignatureID?.uuidString ?? "nil",
+                    "currentPageIndex": state.currentPageIndex,
+                    "preservedActiveID": activeSignatureID?.uuidString ?? "nil"
+                ],
+                hypothesisId: "B"
+            )
+            // #endregion
         }
         
     }

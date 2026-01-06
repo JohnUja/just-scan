@@ -15,6 +15,8 @@ struct SignatureAnnotationPayload: Codable {
     let color: String
     let aspectRatio: CGFloat
     let widthRatio: CGFloat
+    let centerX: CGFloat?        // ✅ NEW: Exact center X (normalized 0-1) to prevent coordinate bouncing
+    let centerY: CGFloat?        // ✅ NEW: Exact center Y (normalized 0-1) to prevent coordinate bouncing
     let imageDataB64: String?     // Optional: base64 encoded image data for self-contained storage
 }
 

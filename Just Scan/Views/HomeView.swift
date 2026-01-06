@@ -199,7 +199,7 @@ struct HomeView: View {
                 )
                 .interactiveDismissDisabled(true) // Prevent accidental swipe-to-dismiss
             }
-            .sheet(item: $selectedDocument) { document in
+            .fullScreenCover(item: $selectedDocument) { document in
                 DocumentReviewView(document: document)
             }
             .sheet(isPresented: $showSettings) {

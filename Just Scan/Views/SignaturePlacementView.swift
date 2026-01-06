@@ -178,6 +178,7 @@ struct SignaturePlacementView: View {
                     position: CGPoint(x: xPos, y: yPos),
                     size: CGSize(width: elementWidth, height: elementHeight),
                     rotation: signatureRotation,
+                    rotationHandleOffset: nil,  // ✅ Use default (scaling) for SignaturePlacementView
                     onMove: { delta in
                         // Center drag should also follow finger position directly
                         // This is handled by the signature image gesture above
@@ -420,12 +421,37 @@ struct SelectionBoxView: View {
     let position: CGPoint
     let size: CGSize
     let rotation: CGFloat
+    let rotationHandleOffset: CGFloat?  // ✅ Optional fixed offset (if nil, uses old scaling behavior)
     let onMove: (CGSize) -> Void
     let onResize: (CGFloat) -> Void
     let onRotate: (CGFloat) -> Void
     let onMoveEnd: () -> Void
     let onResizeEnd: () -> Void
     let onRotateEnd: () -> Void
+    
+    init(
+        position: CGPoint,
+        size: CGSize,
+        rotation: CGFloat,
+        rotationHandleOffset: CGFloat? = nil,  // ✅ Default to nil for backward compatibility
+        onMove: @escaping (CGSize) -> Void,
+        onResize: @escaping (CGFloat) -> Void,
+        onRotate: @escaping (CGFloat) -> Void,
+        onMoveEnd: @escaping () -> Void,
+        onResizeEnd: @escaping () -> Void,
+        onRotateEnd: @escaping () -> Void
+    ) {
+        self.position = position
+        self.size = size
+        self.rotation = rotation
+        self.rotationHandleOffset = rotationHandleOffset
+        self.onMove = onMove
+        self.onResize = onResize
+        self.onRotate = onRotate
+        self.onMoveEnd = onMoveEnd
+        self.onResizeEnd = onResizeEnd
+        self.onRotateEnd = onRotateEnd
+    }
     
     @State private var lastDragLocation: CGPoint = .zero
     @State private var lastResizeDistance: CGFloat = 0
@@ -434,17 +460,32 @@ struct SelectionBoxView: View {
     @State private var showWarning: Bool = false
     @State private var hasStartedDrag: Bool = false // Track if drag has started (minimum distance)
     
-    private let handleSize: CGFloat = 24
+    private let handleSize: CGFloat = 16.8  // 70% of previous 24
     private let minSize: CGFloat = 40
     
     var body: some View {
         ZStack {
-            // ✅ Selection box - NO overlay handles (removed duplicates)
+            // ✅ Selection box border - visual only, doesn't intercept touches
             Rectangle()
-                .stroke(Color.yellow, lineWidth: 2)
+                .stroke(Color.yellow, lineWidth: 3)  // ✅ Thicker line for visibility
                 .frame(width: max(minSize, abs(size.width)), height: max(minSize, abs(size.height)))
                 .rotationEffect(.degrees(rotation))
                 .position(position)
+                .allowsHitTesting(false)  // ✅ Border doesn't intercept touches - allows pan gesture to pass through
+                .onAppear {
+                    // #region agent log
+                    DebugLogger.shared.log(
+                        location: "SelectionBoxView.swift:onAppear",
+                        message: "✅ SelectionBoxView.onAppear",
+                        data: [
+                            "position": "\(position)",
+                            "size": "\(size)",
+                            "rotation": rotation
+                        ],
+                        hypothesisId: "B"
+                    )
+                    // #endregion
+                }
             
             // Warning icon when near borders
             if showWarning {
@@ -452,57 +493,21 @@ struct SelectionBoxView: View {
                     .foregroundColor(.orange)
                     .font(.system(size: 20))
                     .position(CGPoint(x: position.x, y: position.y - size.height/2 - 30))
+                    .allowsHitTesting(false)  // ✅ Warning icon doesn't intercept touches
             }
             
-            // Center drag area for movement (transparent, tappable)
-            Rectangle()
-                .fill(Color.clear)
-                .frame(width: size.width, height: size.height)
-                .rotationEffect(.degrees(rotation))
-                .position(position)
-                .contentShape(Rectangle())
-                .gesture(
-                    DragGesture(minimumDistance: 10) // Require 10pt movement before drag starts (prevents tap from moving)
-                        .onChanged { value in
-                            // Check if we've moved enough to start dragging
-                            let distance = sqrt(
-                                pow(value.location.x - value.startLocation.x, 2) +
-                                pow(value.location.y - value.startLocation.y, 2)
-                            )
-                            
-                            if distance < 10 && !hasStartedDrag {
-                                return // Don't start drag until minimum distance
-                            }
-                            
-                            if !hasStartedDrag {
-                                hasStartedDrag = true
-                                isDragging = true
-                                lastDragLocation = value.startLocation
-                            }
-                            
-                            // Don't invert Y - let controller handle coordinate conversion
-                            let delta = CGSize(
-                                width: value.location.x - lastDragLocation.x,
-                                height: value.location.y - lastDragLocation.y
-                            )
-                            onMove(delta)
-                            lastDragLocation = value.location
-                        }
-                        .onEnded { _ in
-                            lastDragLocation = .zero
-                            isDragging = false
-                            hasStartedDrag = false
-                            onMoveEnd()
-                        }
-                )
+            // ✅ CRITICAL: Pan gesture is handled by PDFView's handlePan (UIKit gesture recognizer)
+            // The selection box border is purely visual - gestures pass through to PDFView
+            // Corner handles and rotation handle still work (they have their own gestures and allowHitTesting)
             
-            // FOUR CORNER HANDLES ONLY (not 8)
+            // FOUR CORNER HANDLES ONLY (not 8) - ✅ MUST have hit testing enabled
             ForEach(0..<4) { index in
                 Circle()
                     .fill(Color.yellow)
-                    .frame(width: 24, height: 24)
+                    .frame(width: handleSize, height: handleSize)  // 70% of previous 24
                     .overlay(Circle().stroke(Color.white, lineWidth: 2))
                     .position(cornerPosition(for: index))
+                    .allowsHitTesting(true)  // ✅ CRITICAL: Corner handles must be interactive
                     .gesture(
                         DragGesture()
                             .onChanged { value in
@@ -535,6 +540,7 @@ struct SelectionBoxView: View {
             }
             
             // ✅ Rotation handle - gray background, positioned above top edge (only one, no duplicates)
+            // ✅ MUST have hit testing enabled
             Image(systemName: "arrow.triangle.2.circlepath")
                 .font(.system(size: 14, weight: .medium))
                 .foregroundColor(.white)
@@ -543,6 +549,7 @@ struct SelectionBoxView: View {
                 .clipShape(Circle())
                 .position(rotationHandlePosition)
                 .zIndex(3000)  // ✅ Above everything
+                .allowsHitTesting(true)  // ✅ CRITICAL: Rotation handle must be interactive
                 .gesture(
                     DragGesture()
                         .onChanged { value in
@@ -593,11 +600,19 @@ struct SelectionBoxView: View {
     }
     
     private var rotationHandlePosition: CGPoint {
-        // ✅ Position above top edge, relative to signature size (scales with signature)
         let angle = rotation * .pi / 180
-        // Distance scales with signature height (at least 30pt, or 20% of height)
-        let baseDistance = max(30, size.height * 0.2)
-        let distance = size.height / 2 + baseDistance
+        
+        // ✅ Use fixed offset if provided, otherwise use old scaling behavior
+        let distance: CGFloat
+        if let fixedOffset = rotationHandleOffset {
+            // Fixed pixel offset (doesn't scale with signature)
+            distance = size.height / 2 + fixedOffset
+        } else {
+            // Old behavior: scales with signature height (at least 30pt, or 20% of height)
+            let baseDistance = max(30, size.height * 0.2)
+            distance = size.height / 2 + baseDistance
+        }
+        
         // Calculate top-center point of rotated selection box
         let topCenterX = position.x + (0 * cos(angle) - (-size.height/2) * sin(angle))
         let topCenterY = position.y + (0 * sin(angle) + (-size.height/2) * cos(angle))
@@ -620,8 +635,7 @@ private struct MoveIconView: View {
     let onMove: (CGSize) -> Void
     let onMoveEnd: (() -> Void)?
     
-    @State private var lastDragLocation: CGPoint = .zero
-    @State private var hasStartedDrag: Bool = false
+    @State private var lastLocation: CGPoint = .zero
     
     var body: some View {
         Image(systemName: "arrow.up.and.down.and.arrow.left.and.right")
@@ -631,28 +645,28 @@ private struct MoveIconView: View {
             .background(Color(white: 0.3, opacity: 0.9))
             .clipShape(Circle())
             .gesture(
-                // ✅ Drag gesture on move icon to move signature
+                // ✅ SIMPLIFIED: Direct delta calculation (same as pan gesture) - no smoothing/throttling
                 DragGesture(minimumDistance: 0)
                     .onChanged { value in
-                        if !hasStartedDrag {
-                            hasStartedDrag = true
-                            lastDragLocation = value.startLocation
+                        if lastLocation == .zero {
+                            lastLocation = value.startLocation
                         }
                         
-                        // Calculate incremental delta
+                        // Calculate delta from last location (same as pan gesture)
                         let delta = CGSize(
-                            width: value.location.x - lastDragLocation.x,
-                            height: value.location.y - lastDragLocation.y
+                            width: value.location.x - lastLocation.x,
+                            height: value.location.y - lastLocation.y
                         )
+                        
+                        // Apply immediately (no smoothing - same as pan gesture)
                         onMove(delta)
-                        lastDragLocation = value.location
+                        lastLocation = value.location
                     }
                     .onEnded { _ in
-                        lastDragLocation = .zero
-                        hasStartedDrag = false
+                        lastLocation = .zero
                         onMoveEnd?()
                     }
-            )
+        )
     }
 }
 

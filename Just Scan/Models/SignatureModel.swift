@@ -96,6 +96,7 @@ struct SignatureModel: Identifiable, Equatable {
     
     // MARK: - Loading from Annotation
     
+    @MainActor
     static func fromAnnotation(_ annotation: PDFAnnotation, page: PDFPage) -> SignatureModel? {
         // CRITICAL: Check if this is our signature annotation (multiple ways for reliability)
         let name = annotation.value(forAnnotationKey: .name) as? String
@@ -137,10 +138,20 @@ struct SignatureModel: Identifiable, Equatable {
         let pageBounds = page.bounds(for: .mediaBox)
         let bounds = annotation.bounds
         
-        let normalizedCenter = CGPoint(
-            x: bounds.midX / pageBounds.width,
-            y: bounds.midY / pageBounds.height
-        )
+        // ✅ CRITICAL: Use exact center from payload if available (prevents coordinate bouncing)
+        // Otherwise, calculate from bounds.midX/Y (padding is symmetric, so center is preserved)
+        let normalizedCenter: CGPoint
+        if let centerX = payload?.centerX, let centerY = payload?.centerY {
+            // Use exact center from payload (prevents bouncing on save/reload)
+            normalizedCenter = CGPoint(x: centerX, y: centerY)
+        } else {
+            // Calculate from bounds (fallback for old annotations)
+            // The bounds center equals the signature center in PDF coordinates (padding is symmetric)
+            normalizedCenter = CGPoint(
+                x: bounds.midX / pageBounds.width,
+                y: bounds.midY / pageBounds.height
+            )
+        }
         
         // Rotation: payload -> legacy -> annotation property (if ImageStampAnnotation)
         let rotation: CGFloat
@@ -192,6 +203,26 @@ struct SignatureModel: Identifiable, Equatable {
             widthRatio = pageBounds.width > 0 ? bounds.width / pageBounds.width : 0.2
         }
         
+        // #region agent log
+        // Log coordinate calculation for debugging bouncing (after widthRatio is calculated)
+        if let stamp = annotation as? ImageStampAnnotation {
+            DebugLogger.shared.log(
+                location: "SignatureModel.swift:fromAnnotation",
+                message: "Calculated center from annotation bounds",
+                data: [
+                    "bounds": "\(bounds)",
+                    "boundsMidX": bounds.midX,
+                    "boundsMidY": bounds.midY,
+                    "pageBounds": "\(pageBounds)",
+                    "normalizedCenter": "\(normalizedCenter)",
+                    "storedWidthRatio": stamp.originalWidthRatio,
+                    "calculatedWidthRatio": widthRatio
+                ],
+                hypothesisId: "C"
+            )
+        }
+        // #endregion
+        
         // Image ID: payload -> annotation property -> generate from imageData
         let imageID: String
         if let id = payload?.imageID, !id.isEmpty {
@@ -200,11 +231,45 @@ struct SignatureModel: Identifiable, Equatable {
             imageID = stamp.imageID
         } else if let b64 = payload?.imageDataB64 ?? legacyMetadata?.imageDataB64,
                   let data = Data(base64Encoded: b64) {
-            // Generate stable ID from image data (deterministic)
-            imageID = "img_" + String(data.hashValue)
+            // Generate stable ID from image data (deterministic hash)
+            imageID = "img_" + data.sha256Hex.prefix(32)
         } else {
             // Last resort: generate new ID (shouldn't happen)
             imageID = UUID().uuidString
+        }
+        
+        // ✅ CRITICAL: Verify image can be recovered (for debugging)
+        // Try multiple sources to ensure we have a valid image
+        var imageRecovered = false
+        
+        // 1. Try ImageStampAnnotation.imageSnapshot
+        if let stamp = annotation as? ImageStampAnnotation,
+           let _ = stamp.imageSnapshot {
+            imageRecovered = true
+            print("✅ fromAnnotation: Got image from ImageStampAnnotation.imageSnapshot")
+        }
+        // 2. Try imageData from payload
+        else if let b64 = payload?.imageDataB64 ?? legacyMetadata?.imageDataB64,
+                 let data = Data(base64Encoded: b64),
+                 let _ = UIImage(data: data) {
+            imageRecovered = true
+            print("✅ fromAnnotation: Got image from payload imageDataB64")
+        }
+        // 3. Try SignatureService (for recent signatures)
+        else if let serviceUUID = UUID(uuidString: imageID),
+                 let _ = SignatureService.shared.signatureHistory.first(where: { $0.id == serviceUUID }) {
+            imageRecovered = true
+            print("✅ fromAnnotation: Got image from SignatureService")
+        }
+        // 4. Fallback to current signature
+        else if SignatureService.shared.signatureImage != nil {
+            imageRecovered = true
+            print("⚠️ fromAnnotation: Using fallback signature image")
+        }
+        
+        if !imageRecovered {
+            print("❌ fromAnnotation: No image available for signature \(sigUUID)")
+            // Still return model - image will be recovered on demand
         }
         
         return SignatureModel(
@@ -243,5 +308,17 @@ enum SignatureColor: String, CaseIterable, Codable {
         case .blue: return .systemBlue
         case .red: return .systemRed
         }
+    }
+}
+
+// MARK: - Data Extension for SHA256 Hashing
+
+import CryptoKit
+
+extension Data {
+    /// Returns SHA256 hash as hexadecimal string
+    var sha256Hex: String {
+        let hash = SHA256.hash(data: self)
+        return hash.compactMap { String(format: "%02x", $0) }.joined()
     }
 }

@@ -109,16 +109,22 @@ struct DocumentGridView: View {
 
 struct PDFThumbnailView: View {
     let documentURL: URL
+    @State private var refreshID = UUID()  // Force refresh when file changes
     
     var body: some View {
         Group {
             if let pdfDocument = PDFDocument(url: documentURL),
                let firstPage = pdfDocument.page(at: 0) {
                 PDFPageView(page: firstPage)
+                    .id(refreshID)  // Force recreation on refresh
             } else {
                 Rectangle()
                     .fill(Color.gray.opacity(0.3))
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSNotification.Name("RefreshDocumentThumbnails"))) { _ in
+            // Force refresh by updating ID
+            refreshID = UUID()
         }
     }
 }

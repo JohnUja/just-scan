@@ -99,7 +99,25 @@ class PDFEditorControllerProxy: ObservableObject {
     }
     
     func getActiveSignatureScreenRect() -> CGRect? {
-        return controller?.getActiveSignatureScreenRect()
+        guard let controller = controller else {
+            // #region agent log
+            DebugLogger.shared.logHypothesis("B", message: "PDFEditorControllerProxy: controller is nil", data: [:])
+            // #endregion
+            return nil
+        }
+        // #region agent log
+        DebugLogger.shared.log(location: "PDFEditorControllerProxy.swift:\(#line)", message: "Calling getActiveSignatureScreenRect on controller", data: [:], hypothesisId: "B")
+        // #endregion
+        guard let rect = controller.getActiveSignatureScreenRect() else {
+            // #region agent log
+            DebugLogger.shared.logHypothesis("B", message: "PDFEditorControllerProxy: getActiveSignatureScreenRect returned nil", data: [:])
+            // #endregion
+            return nil
+        }
+        // #region agent log
+        DebugLogger.shared.log(location: "PDFEditorControllerProxy.swift:\(#line)", message: "PDFEditorControllerProxy: getActiveSignatureScreenRect result", data: ["rect": "\(rect)"], hypothesisId: "B")
+        // #endregion
+        return rect
     }
     
     func getSignatureScreenPosition(signatureID: UUID, pageIndex: Int) -> CGPoint? {

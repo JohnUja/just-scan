@@ -19,10 +19,17 @@ class ImageStampAnnotation: PDFAnnotation {
     var signatureID: String
     var imageID: String
     
-    private var storedImageData: Data?
+    var storedImageData: Data?  // ✅ Current tinted image data (for drawing)
+    var baseImageData: Data?  // ✅ CRITICAL: Original untinted image (never changes, used for retinting)
     
     var imageSnapshot: UIImage? {
         guard let data = storedImageData else { return nil }
+        return UIImage(data: data)
+    }
+    
+    /// Get the original untinted base image (for color changes)
+    var baseImage: UIImage? {
+        guard let data = baseImageData else { return nil }
         return UIImage(data: data)
     }
     
@@ -33,7 +40,11 @@ class ImageStampAnnotation: PDFAnnotation {
         self.originalWidthRatio = widthRatio
         self.signatureID = signatureID
         self.imageID = imageID
-        self.storedImageData = image.pngData()
+        // ✅ STRATEGY A: Store base (untinted) image in both baseImageData and storedImageData
+        // The draw() method will tint it based on originalColor
+        let baseImageData = image.pngData()
+        self.baseImageData = baseImageData  // Original untinted image (never changes)
+        self.storedImageData = baseImageData  // Also store as base (draw() will tint on render)
         
         super.init(bounds: bounds, forType: .stamp, withProperties: nil)
         
@@ -41,7 +52,8 @@ class ImageStampAnnotation: PDFAnnotation {
         self.userName = signatureID
         self.setValue(SignatureAnnotationKeys.annotationName, forAnnotationKey: .name)
         
-        updateContents()
+        // ✅ Initialize payload without center (center will be set later via updatePayload when annotation is added to page)
+        updateContents(centerNormalized: nil)
     }
     
     required init?(coder: NSCoder) {
@@ -84,6 +96,12 @@ class ImageStampAnnotation: PDFAnnotation {
         }
         
         storedImageData = coder.decodeObject(of: NSData.self, forKey: "storedImageData") as Data?
+        baseImageData = coder.decodeObject(of: NSData.self, forKey: "baseImageData") as Data?
+        
+        // ✅ If baseImageData is missing (old annotations), use storedImageData as fallback
+        if baseImageData == nil {
+            baseImageData = storedImageData
+        }
         
         super.init(coder: coder)
         
@@ -103,14 +121,45 @@ class ImageStampAnnotation: PDFAnnotation {
         if let imageData = storedImageData {
             coder.encode(imageData as NSData, forKey: "storedImageData")
         }
+        if let baseData = baseImageData {
+            coder.encode(baseData as NSData, forKey: "baseImageData")
+        }
     }
     
+    /// Update payload with optional center coordinates (prevents post-save drift)
+    /// ✅ CRITICAL: Always use this method, never updatePayloadIfNeeded() (which wipes center)
+    func updatePayload(centerNormalized: CGPoint?) {
+        updateContents(centerNormalized: centerNormalized)
+    }
+    
+    /// ✅ DEPRECATED: This method can wipe center - use updatePayload(centerNormalized:) instead
+    /// This will crash in debug to prevent accidental use
+    @available(*, deprecated, message: "Use updatePayload(centerNormalized:) with a real center to preserve center")
     func updatePayloadIfNeeded() {
-        updateContents()
+#if DEBUG
+        fatalError("Do not call updatePayloadIfNeeded() - use updatePayload(centerNormalized:) instead")
+#else
+        // In release, preserve existing center as fallback (but this should never be called)
+        var existingCenter: CGPoint? = nil
+        if let contents = self.contents,
+           contents.hasPrefix(SignatureAnnotationKeys.payloadPrefix) {
+            let json = String(contents.dropFirst(SignatureAnnotationKeys.payloadPrefix.count))
+            if let data = json.data(using: .utf8),
+               let payload = try? JSONDecoder().decode(SignatureAnnotationPayload.self, from: data) {
+                if let centerX = payload.centerX, let centerY = payload.centerY {
+                    existingCenter = CGPoint(x: centerX, y: centerY)
+                }
+            }
+        }
+        updateContents(centerNormalized: existingCenter)
+#endif
     }
     
-    private func updateContents() {
-        guard let imageData = storedImageData else { return }
+    private func updateContents(centerNormalized: CGPoint? = nil) {
+        // ✅ STRATEGY A: Store base (untinted) image in payload for clean retinting
+        // Use baseImageData if available, fallback to storedImageData for backward compatibility
+        let baseData = baseImageData ?? storedImageData
+        guard let imageData = baseData else { return }
         let b64 = imageData.base64EncodedString()
         
         let payload = SignatureAnnotationPayload(
@@ -121,6 +170,8 @@ class ImageStampAnnotation: PDFAnnotation {
             color: originalColor.rawValue,
             aspectRatio: originalAspectRatio,
             widthRatio: originalWidthRatio,
+            centerX: centerNormalized?.x,  // ✅ CRITICAL: Store exact center to prevent post-save drift
+            centerY: centerNormalized?.y,  // ✅ CRITICAL: Store exact center to prevent post-save drift
             imageDataB64: b64  // Store image data for self-contained storage
         )
         
@@ -131,10 +182,20 @@ class ImageStampAnnotation: PDFAnnotation {
     }
     
     // CRITICAL FIX: Draw in annotation-local coordinates
+    // ✅ STRATEGY A: Tint in draw only - storedImageData should be base (untinted) image
     override func draw(with box: PDFDisplayBox, in context: CGContext) {
-        guard let imageData = storedImageData,
-              let image = UIImage(data: imageData) else { return }
+        // ✅ NOTE: Cannot log here - draw() is called from PDFKit's rendering context (not main actor)
+        // Logging should happen at controller level, not in draw() method
+        
+        // ✅ Use baseImageData (untinted) for tinting, fallback to storedImageData for backward compatibility
+        let baseData = baseImageData ?? storedImageData
+        guard let imageData = baseData,
+              let image = UIImage(data: imageData) else {
+            // Cannot log here - not on main actor
+            return
+        }
 
+        // ✅ Tint the base image using current color (no double-tinting)
         let tinted = applyColorTint(to: image, color: originalColor.uiColor)
         guard let cgImage = tinted.cgImage else { return }
 
@@ -157,7 +218,7 @@ class ImageStampAnnotation: PDFAnnotation {
         }
 
         context.saveGState()
-
+        
         // Move origin to annotation rect (LOCALIZE)
         context.translateBy(x: b.minX, y: b.minY)
 
