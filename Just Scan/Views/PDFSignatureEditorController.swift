@@ -1338,22 +1338,7 @@ class PDFSignatureEditorController: UIViewController {
             }
             
         case .changed:
-            // #region agent log
-            // ✅ Removed unsafe value(forKey:) call - can cause crashes
-            // Log periodically using timestamp instead
-            let timestamp = Date().timeIntervalSince1970
-            if Int(timestamp * 10) % 10 == 0 {  // Log every ~1 second to avoid spam
-                DebugLogger.shared.log(
-                    location: "PDFSignatureEditorController.swift:handlePan",
-                    message: "Pan gesture changed",
-                    data: [
-                        "location": "\(location)",
-                        "pdfPoint": "\(pdfPoint)",
-                        "velocity": "\(gesture.velocity(in: pdfView))"
-                    ],
-                    hypothesisId: "MOVE"
-                )
-            }
+            // #region agent log - REMOVED: Too verbose during drag
             // #endregion
             guard let startCenter = gestureStartCenter else {
                 // #region agent log
@@ -1572,22 +1557,7 @@ class PDFSignatureEditorController: UIViewController {
             let rotationDelta = gesture.rotation * 180 / .pi // Convert to degrees
             let newRotation = (startRotation + rotationDelta).truncatingRemainder(dividingBy: 360)
             
-            // #region agent log
-            let frameCount = Int(Date().timeIntervalSince1970 * 100) % 10
-            if frameCount == 0 {  // Log periodically to avoid spam
-                DebugLogger.shared.log(
-                    location: "PDFSignatureEditorController.swift:handleRotation",
-                    message: "Rotation gesture changed",
-                    data: [
-                        "startRotation": startRotation,
-                        "rotationDelta": rotationDelta,
-                        "newRotation": newRotation,
-                        "gestureRotation": gesture.rotation,
-                        "isCommitted": signature.isCommitted
-                    ],
-                    hypothesisId: "ROTATE"
-                )
-            }
+            // #region agent log - REMOVED: Too verbose during rotation
             // #endregion
             
             signature.rotation = newRotation
@@ -1735,24 +1705,8 @@ extension PDFSignatureEditorController: UIGestureRecognizerDelegate {
     /// Returns nil if no active signature or page not found
     /// Uses caching to prevent excessive recalculations during drag operations
     func getActiveSignatureScreenRect() -> CGRect? {
-        // #region agent log
-        getActiveSignatureScreenRectCallCount += 1
-        let timestamp = Date().timeIntervalSince1970
-        let frameID = Int(timestamp * 60) % 60  // Log every ~1 second (60fps)
-        if getActiveSignatureScreenRectCallCount % 60 == 0 || frameID == 0 {  // Throttle to avoid spam
-            DebugLogger.shared.log(
-                location: "PDFSignatureEditorController.swift:getActiveSignatureScreenRect",
-                message: "📊 getActiveSignatureScreenRect called",
-                data: [
-                    "callCount": getActiveSignatureScreenRectCallCount,
-                    "timestamp": timestamp,
-                    "activeID": activeSignatureID?.uuidString ?? "nil",
-                    "isInGesture": isInGesture,
-                    "hasCache": cachedScreenRect != nil
-                ],
-                hypothesisId: "JITTER"
-            )
-        }
+        // #region agent log - REMOVED: Too verbose, only log cache hits
+        // getActiveSignatureScreenRectCallCount += 1
         // #endregion
         
         guard let activeID = activeSignatureID else {
@@ -1779,17 +1733,16 @@ extension PDFSignatureEditorController: UIGestureRecognizerDelegate {
         if isInGesture,
            let cached = cachedScreenRect,
            cachedScreenRectSignatureID == activeID {
-            // #region agent log
-            if getActiveSignatureScreenRectCallCount % 60 == 0 || frameID == 0 {
-                DebugLogger.shared.log(
-                    location: "PDFSignatureEditorController.swift:getActiveSignatureScreenRect",
-                    message: "📊 Using cached rect (in gesture)",
-                    data: [
-                        "cachedRect": "\(cached)"
-                    ],
-                    hypothesisId: "JITTER"
-                )
-            }
+            // #region agent log - KEEP: Shows cache is working (reduces jitter)
+            DebugLogger.shared.log(
+                location: "PDFSignatureEditorController.swift:getActiveSignatureScreenRect",
+                message: "✅ Using cached rect (in gesture) - prevents jitter",
+                data: [
+                    "cachedRect": "\(cached)",
+                    "activeID": activeID.uuidString
+                ],
+                hypothesisId: "JITTER"
+            )
             // #endregion
             return cached
         }
@@ -1811,39 +1764,13 @@ extension PDFSignatureEditorController: UIGestureRecognizerDelegate {
             rectSource = "model.pdfRect"
         }
         
-        // #region agent log
-        if getActiveSignatureScreenRectCallCount % 60 == 0 || frameID == 0 {
-            DebugLogger.shared.log(
-                location: "PDFSignatureEditorController.swift:getActiveSignatureScreenRect",
-                message: "📊 Rect calculation",
-                data: [
-                    "rectSource": rectSource,
-                    "isCommitted": signature.isCommitted,
-                    "pdfRect": "\(pdfRect)",
-                    "modelCenter": "\(signature.center)",
-                    "modelRotation": signature.rotation
-                ],
-                hypothesisId: "JITTER"
-            )
-        }
+        // #region agent log - REMOVED: Too verbose
         // #endregion
         
         // Convert PDF rect to screen rect
         let screenRect = PDFCoordinateConverter.pdfRectToView(pdfRect, page: page, pdfView: pdfView)
         
-        // #region agent log
-        if getActiveSignatureScreenRectCallCount % 60 == 0 || frameID == 0 {
-            DebugLogger.shared.log(
-                location: "PDFSignatureEditorController.swift:getActiveSignatureScreenRect",
-                message: "📊 Screen rect result",
-                data: [
-                    "screenRect": "\(screenRect)",
-                    "width": screenRect.width,
-                    "height": screenRect.height
-                ],
-                hypothesisId: "JITTER"
-            )
-        }
+        // #region agent log - REMOVED: Too verbose
         // #endregion
         
         // Guard against invalid rect
@@ -1857,7 +1784,7 @@ extension PDFSignatureEditorController: UIGestureRecognizerDelegate {
         // ✅ CRITICAL FIX: Cache the result to prevent recalculation on every SwiftUI render
         cachedScreenRect = screenRect
         cachedScreenRectSignatureID = activeID
-        cachedScreenRectTimestamp = timestamp
+        cachedScreenRectTimestamp = Date().timeIntervalSince1970
         
         return screenRect
     }

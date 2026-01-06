@@ -349,23 +349,8 @@ struct DocumentReviewView: View {
                                     .zIndex(1000)
                                     .id("selection-\(activeID.uuidString)-\(currentPageIndex)-\(selectionBoxRefreshID)")
                                     .onAppear {
-                                        // #region agent log
-                                        selectionBoxRenderCount += 1
-                                        if selectionBoxRenderCount % 60 == 0 {  // Throttle to avoid spam
-                                            DebugLogger.shared.log(
-                                                location: "DocumentReviewView.swift:SelectionBoxView",
-                                                message: "📦 SelectionBoxView rendering",
-                                                data: [
-                                                    "renderCount": selectionBoxRenderCount,
-                                                    "activeID": activeID.uuidString,
-                                                    "screenRect": "\(screenRect)",
-                                                    "rectCenter": "\(rectCenter)",
-                                                    "rotation": activeSignature.rotation,
-                                                    "isCommitted": activeSignature.isCommitted
-                                                ],
-                                                hypothesisId: "JITTER"
-                                            )
-                                        }
+                                        // #region agent log - REMOVED: Too verbose (renders every frame)
+                                        // selectionBoxRenderCount += 1
                                         // #endregion
                                     }
                                 } else {
