@@ -40,9 +40,11 @@ class ImageStampAnnotation: PDFAnnotation {
         self.originalWidthRatio = widthRatio
         self.signatureID = signatureID
         self.imageID = imageID
-        // ✅ STRATEGY A: Store base (untinted) image in both baseImageData and storedImageData
-        // The draw() method will tint it based on originalColor
-        let baseImageData = image.pngData()
+        // ✅ CRITICAL FIX: Normalize image orientation to .up BEFORE storing
+        // This prevents color tinting from flipping/inverting the signature
+        // UIGraphicsImageRenderer doesn't preserve orientation metadata, so we must ensure .up
+        let normalizedImage = image.normalizedToUp()
+        let baseImageData = normalizedImage.pngData()
         self.baseImageData = baseImageData  // Original untinted image (never changes)
         self.storedImageData = baseImageData  // Also store as base (draw() will tint on render)
         
@@ -194,7 +196,7 @@ class ImageStampAnnotation: PDFAnnotation {
             // Cannot log here - not on main actor
             return
         }
-
+        
         // ✅ Tint the base image using current color (no double-tinting)
         let tinted = applyColorTint(to: image, color: originalColor.uiColor)
         guard let cgImage = tinted.cgImage else { return }
@@ -218,6 +220,9 @@ class ImageStampAnnotation: PDFAnnotation {
         }
 
         context.saveGState()
+        
+        // ✅ REMOVED: CTM logging from draw() - draw() runs off main actor, can't call main actor-isolated DebugLogger
+        // CTM tracking will be done from controller side before/after setNeedsDisplay()
         
         // Move origin to annotation rect (LOCALIZE)
         context.translateBy(x: b.minX, y: b.minY)
@@ -255,5 +260,25 @@ class ImageStampAnnotation: PDFAnnotation {
             context.cgContext.setBlendMode(.destinationIn)
             context.cgContext.draw(cgImage, in: CGRect(origin: .zero, size: size))
         }
+    }
+}
+
+// MARK: - UIImage Orientation Normalization Extension
+extension UIImage {
+    /// Normalize image orientation to .up to prevent flipping during color tinting
+    /// UIGraphicsImageRenderer doesn't preserve orientation metadata, so we must redraw
+    func normalizedToUp() -> UIImage {
+        // If already .up, no work needed
+        if imageOrientation == .up {
+            return self
+        }
+        
+        // Redraw the image in correct orientation
+        UIGraphicsBeginImageContextWithOptions(size, false, scale)
+        draw(in: CGRect(origin: .zero, size: size))
+        let normalizedImage = UIGraphicsGetImageFromCurrentImageContext()
+        UIGraphicsEndImageContext()
+        
+        return normalizedImage ?? self
     }
 }

@@ -452,18 +452,22 @@ class PDFSignatureEditorController: UIViewController {
            let page = pdfDocument?.page(at: currentPageIndex) {
             // ✅ CRITICAL: Ensure annotation is updated without remove/add to prevent visual flipping
             if let existing = findAnnotation(for: signature.id, page: page) as? ImageStampAnnotation {
-                // #region agent log
+                // #region agent log - Track color change and annotation state
                 let oldRotation = existing.originalRotation
                 let oldColor = existing.originalColor
+                let oldBounds = existing.bounds
+                
+                // Log before color change to track CTM/state
                 DebugLogger.shared.log(
-                    location: "PDFSignatureEditorController.swift:\(#line)",
-                    message: "Updating annotation metadata for color change (no remove/add)",
+                    location: "PDFSignatureEditorController.swift:changeActiveSignatureColor",
+                    message: "BEFORE color change - annotation state",
                     data: [
-                        "oldRotation": oldRotation,
-                        "newRotation": signature.rotation,
+                        "sigID": signature.id.uuidString,
                         "oldColor": oldColor.rawValue,
-                        "newColor": signature.color.rawValue,
-                        "rotationChanged": oldRotation != signature.rotation
+                        "newColor": color.rawValue,
+                        "oldRotation": oldRotation,
+                        "oldBounds": "\(oldBounds)",
+                        "isCommitted": signature.isCommitted
                     ],
                     hypothesisId: "COLOR"
                 )
@@ -826,34 +830,26 @@ class PDFSignatureEditorController: UIViewController {
         let baseCenterX = signature.center.x * pageBounds.width
         let baseCenterY = signature.center.y * pageBounds.height
         
-        let baseRect = CGRect(
-            x: baseCenterX - baseWidth / 2,
-            y: baseCenterY - baseHeight / 2,
-            width: baseWidth,
-            height: baseHeight
-        )
-        
         // Calculate padded bounding box for rotation
         let rotationRadians = abs(signature.rotation.truncatingRemainder(dividingBy: 180)) * .pi / 180
-        let rotatedWidth = abs(cos(rotationRadians)) * baseRect.width + abs(sin(rotationRadians)) * baseRect.height
-        let rotatedHeight = abs(sin(rotationRadians)) * baseRect.width + abs(cos(rotationRadians)) * baseRect.height
+        let rotatedWidth = abs(cos(rotationRadians)) * baseWidth + abs(sin(rotationRadians)) * baseHeight
+        let rotatedHeight = abs(sin(rotationRadians)) * baseWidth + abs(cos(rotationRadians)) * baseHeight
         
-        let boundsWidth = max(rotatedWidth, baseRect.width) * 1.05
-        let boundsHeight = max(rotatedHeight, baseRect.height) * 1.05
+        let boundsWidth = max(rotatedWidth, baseWidth) * 1.05
+        let boundsHeight = max(rotatedHeight, baseHeight) * 1.05
         
-        // ✅ CRITICAL: Use EXACT center (baseCenterX/Y) not baseRect.midX/Y to prevent rounding errors
+        // ✅ CRITICAL FIX: Do NOT clamp annotation bounds
+        // Clamping shifts the rect which causes annotation center to differ from model center
+        // This causes "bouncing" where signature appears to move within selection box
+        // Let PDFKit handle clipping - signatures can extend slightly past page visually
         let bounds = CGRect(
-            x: baseCenterX - boundsWidth / 2,  // Use exact center, not baseRect.midX
-            y: baseCenterY - boundsHeight / 2, // Use exact center, not baseRect.midY
+            x: baseCenterX - boundsWidth / 2,
+            y: baseCenterY - boundsHeight / 2,
             width: boundsWidth,
             height: boundsHeight
         )
         
-        // ✅ CRITICAL FIX: Clamp bounds but NEVER mutate model here (prevents cross-page corruption)
-        // Model mutation in geometry helpers creates hidden feedback loops and cross-page bugs
-        // If clamping is needed, do it where the model changes (pan/move), not in annotation rendering
-        let clamped = PDFCoordinateConverter.clampRectToPageBounds(bounds, page: page)
-        existing.bounds = clamped
+        existing.bounds = bounds
     }
     
     /// Upsert annotation: update existing or create new
@@ -918,17 +914,16 @@ class PDFSignatureEditorController: UIViewController {
         let centerX = pdfRect.midX
         let centerY = pdfRect.midY
         
-        let bounds = CGRect(
+        // ✅ CRITICAL FIX: Do NOT clamp bounds - clamping causes center shift which causes bouncing
+        let annotationBounds = CGRect(
             x: centerX - boundsWidth / 2,
             y: centerY - boundsHeight / 2,
             width: boundsWidth,
             height: boundsHeight
         )
         
-        let clampedBounds = PDFCoordinateConverter.clampRectToPageBounds(bounds, page: page)
-        
         let annotation = ImageStampAnnotation(
-            bounds: clampedBounds,
+            bounds: annotationBounds,
             image: finalImage,
             rotation: signature.rotation,
             color: signature.color,
@@ -1372,6 +1367,10 @@ class PDFSignatureEditorController: UIViewController {
                     pageSignatures[index] = signature
                     signatures[currentPageIndex] = pageSignatures
                     
+                    // #region agent log - RECT PROBE during pan gesture
+                    debugRectProbe("PAN_CHANGED", signature: signature, page: page)
+                    // #endregion
+                    
                     // ✅ Clear cache when signature position changes (prevents stale cache during drag)
                     clearScreenRectCache()
                     
@@ -1397,8 +1396,16 @@ class PDFSignatureEditorController: UIViewController {
             ], hypothesisId: "MOVE")
             // #endregion
             
+            // #region agent log - RECT PROBE at end of drag
+            debugRectProbe("PAN_ENDED", signature: signature, page: page)
+            // #endregion
+            
             if signature.isCommitted {
                 upsertAnnotation(for: signature, on: page)
+                
+                // #region agent log - RECT PROBE after upsertAnnotation
+                debugRectProbe("PAN_AFTER_UPSERT", signature: signature, page: page)
+                // #endregion
             }
             
             gestureStartSignatureID = nil
@@ -1568,6 +1575,10 @@ class PDFSignatureEditorController: UIViewController {
                     pageSignatures[index] = signature
                     signatures[currentPageIndex] = pageSignatures
                     
+                    // #region agent log - RECT PROBE during rotation
+                    debugRectProbe("ROTATE_CHANGED", signature: signature, page: page)
+                    // #endregion
+                    
                     // ✅ CRITICAL FIX: During rotation .changed, ONLY update rotation and redraw
                     // Do NOT recompute padded bounds/clamp every frame (causes bouncing/oscillation)
                     // Do NOT clear cache during rotation - keep cached rect to prevent jittering
@@ -1599,11 +1610,19 @@ class PDFSignatureEditorController: UIViewController {
             ], hypothesisId: "ROTATE")
             // #endregion
             
+            // #region agent log - RECT PROBE at end of rotation
+            debugRectProbe("ROTATE_ENDED", signature: signature, page: page)
+            // #endregion
+            
             // ✅ CRITICAL FIX: On rotation .ended, finalize by recomputing padded bounds once and updating payload
             // This is the ONLY place bounds and payload should be updated during rotation
             if signature.isCommitted,
                let page = pdfDocument?.page(at: currentPageIndex) {
                 upsertAnnotation(for: signature, on: page)  // This calls updatePayload internally
+                
+                // #region agent log - RECT PROBE after upsertAnnotation
+                debugRectProbe("ROTATE_AFTER_UPSERT", signature: signature, page: page)
+                // #endregion
             }
             
             gestureStartRotation = nil
@@ -1703,12 +1722,8 @@ extension PDFSignatureEditorController: UIGestureRecognizerDelegate {
     
     /// Get the screen rect of the active signature
     /// Returns nil if no active signature or page not found
-    /// Uses caching to prevent excessive recalculations during drag operations
+    /// Uses caching to prevent excessive recalculations during SwiftUI render cycles
     func getActiveSignatureScreenRect() -> CGRect? {
-        // #region agent log - REMOVED: Too verbose, only log cache hits
-        // getActiveSignatureScreenRectCallCount += 1
-        // #endregion
-        
         guard let activeID = activeSignatureID else {
             cachedScreenRect = nil
             cachedScreenRectSignatureID = nil
@@ -1727,51 +1742,18 @@ extension PDFSignatureEditorController: UIGestureRecognizerDelegate {
             return nil
         }
         
-        // ✅ CRITICAL FIX: Use cache during gestures to prevent jittering
-        // If we're in a gesture and have a valid cache for this signature, return cached value
-        // This prevents SwiftUI from recalculating the rect on every render during gestures
+        // ✅ CRITICAL FIX: During gestures, return cached rect (set by moveActiveSignature/resize/rotate)
+        // The cache is always calculated from model, ensuring consistency
         if isInGesture,
            let cached = cachedScreenRect,
            cachedScreenRectSignatureID == activeID {
-            // #region agent log - KEEP: Shows cache is working (reduces jitter)
-            DebugLogger.shared.log(
-                location: "PDFSignatureEditorController.swift:getActiveSignatureScreenRect",
-                message: "✅ Using cached rect (in gesture) - prevents jitter",
-                data: [
-                    "cachedRect": "\(cached)",
-                    "activeID": activeID.uuidString
-                ],
-                hypothesisId: "JITTER"
-            )
-            // #endregion
             return cached
         }
         
-        // ✅ CRITICAL FIX: Use different rect source based on signature state
-        // Uncommitted (SwiftUI overlay): Use model geometry (center/widthRatio/rotation)
-        // Committed (PDFKit annotation): Use annotation bounds (prevents drift from padding/clamping)
-        let pdfRect: CGRect
-        let rectSource: String
-        if signature.isCommitted,
-           let annotation = findAnnotation(for: activeID, page: page) as? ImageStampAnnotation {
-            // ✅ Committed: Use annotation bounds (PDFKit's actual drawn bounds)
-            // This prevents "signature moves inside box" from padding/clamping/normalization
-            pdfRect = annotation.bounds
-            rectSource = "annotation.bounds"
-        } else {
-            // ✅ Uncommitted: Use model geometry (SwiftUI is drawing it)
-            pdfRect = signature.pdfRect(for: page)
-            rectSource = "model.pdfRect"
-        }
-        
-        // #region agent log - REMOVED: Too verbose
-        // #endregion
-        
-        // Convert PDF rect to screen rect
+        // ✅ Calculate from model (authoritative source)
+        // Selection box should match model position, not padded annotation bounds
+        let pdfRect = signature.pdfRect(for: page)
         let screenRect = PDFCoordinateConverter.pdfRectToView(pdfRect, page: page, pdfView: pdfView)
-        
-        // #region agent log - REMOVED: Too verbose
-        // #endregion
         
         // Guard against invalid rect
         guard screenRect.width.isFinite && screenRect.height.isFinite,
@@ -1781,7 +1763,7 @@ extension PDFSignatureEditorController: UIGestureRecognizerDelegate {
             return nil
         }
         
-        // ✅ CRITICAL FIX: Cache the result to prevent recalculation on every SwiftUI render
+        // ✅ Cache result for subsequent SwiftUI render calls (prevents excessive recalculation)
         cachedScreenRect = screenRect
         cachedScreenRectSignatureID = activeID
         cachedScreenRectTimestamp = Date().timeIntervalSince1970
@@ -1793,6 +1775,38 @@ extension PDFSignatureEditorController: UIGestureRecognizerDelegate {
     private func clearScreenRectCache() {
         cachedScreenRect = nil
         cachedScreenRectSignatureID = nil
+    }
+    
+    /// ✅ DEBUG: Log rect probe to track what's changing during gestures
+    private func debugRectProbe(_ tag: String, signature: SignatureModel, page: PDFPage) {
+        let modelRect = signature.pdfRect(for: page)
+        
+        let annRect: CGRect? = {
+            guard let ann = findAnnotation(for: signature.id, page: page) as? ImageStampAnnotation else { return nil }
+            return ann.bounds
+        }()
+        
+        let screenModel = PDFCoordinateConverter.pdfRectToView(modelRect, page: page, pdfView: pdfView)
+        let screenAnn = annRect.map { PDFCoordinateConverter.pdfRectToView($0, page: page, pdfView: pdfView) }
+        
+        // #region agent log
+        DebugLogger.shared.log(
+            location: "PDFSignatureEditorController.swift:debugRectProbe",
+            message: "RECT PROBE \(tag)",
+            data: [
+                "id": signature.id.uuidString,
+                "centerNorm": "\(signature.center)",
+                "rot": "\(signature.rotation)",
+                "widthRatio": signature.widthRatio,
+                "modelRect": "\(modelRect)",
+                "annRect": annRect.map { "\($0)" } ?? "nil",
+                "screenModel": "\(screenModel)",
+                "screenAnn": screenAnn.map { "\($0)" } ?? "nil",
+                "isCommitted": signature.isCommitted
+            ],
+            hypothesisId: "JITTER"
+        )
+        // #endregion
     }
     
     /// Get screen position for any signature
@@ -1848,11 +1862,6 @@ extension PDFSignatureEditorController: UIGestureRecognizerDelegate {
             isInGesture = true  // ✅ Mark that we're in a gesture to use cache
             registerUndoSnapshot(for: currentPageIndex)
             isMovingSignature = true
-            // Cache the initial rect to prevent jittering
-            if let initialRect = getActiveSignatureScreenRect() {
-                cachedScreenRect = initialRect
-                cachedScreenRectSignatureID = activeID
-            }
         }
         
         // Convert screen delta to normalized delta using scaleFactor + flipY
@@ -1872,6 +1881,13 @@ extension PDFSignatureEditorController: UIGestureRecognizerDelegate {
             pageSignatures[idx] = signature
             signatures[currentPageIndex] = pageSignatures
             
+            // ✅ CRITICAL FIX: Recalculate screen rect from model AFTER update (prevents delta drift)
+            // Don't accumulate deltas in cache - always use authoritative model position
+            let modelRect = signature.pdfRect(for: page)
+            let modelScreenRect = PDFCoordinateConverter.pdfRectToView(modelRect, page: page, pdfView: pdfView)
+            cachedScreenRect = modelScreenRect
+            cachedScreenRectSignatureID = activeID
+            
             // If committed, update annotation live
             if signature.isCommitted,
                let existing = findAnnotation(for: activeID, page: page) as? ImageStampAnnotation {
@@ -1882,28 +1898,40 @@ extension PDFSignatureEditorController: UIGestureRecognizerDelegate {
                 existing.originalAspectRatio = signature.aspectRatio
                 // ✅ During move: Only update bounds + metadata + redraw (no payload update - too expensive per frame)
                 pdfView.setNeedsDisplay()
+            } else {
+                // ✅ CRITICAL FIX: Update overlay immediately for uncommitted signatures
+                // This makes the signature move in real-time with the selection box
+                renderSignatureOverlays()
             }
         }
         
-        // ✅ CRITICAL: Don't call renderSignatureOverlays() on every move - too expensive and causes jittering
-        // Only update annotation bounds directly (same as pan gesture)
         hasPendingChangesSubject.send(true)
-        // renderSignatureOverlays() - REMOVED: Only needed for uncommitted signatures
     }
     
     func endMoveSignature() {
         isMovingSignature = false
         isInGesture = false  // ✅ Clear gesture flag
-        // ✅ Clear cache to force selection box recalculation with new position
-        clearScreenRectCache()
         
-        // ✅ CRITICAL: Update payload with exact center ONCE at end (not every frame)
+        // ✅ CRITICAL: Compute final rect from truth source once, then clear cache
         if let activeID = activeSignatureID,
            let signature = getSignature(id: activeID, pageIndex: currentPageIndex),
-           let page = pdfDocument?.page(at: currentPageIndex),
-           let existing = findAnnotation(for: activeID, page: page) as? ImageStampAnnotation {
-            existing.updatePayload(centerNormalized: signature.center)
+           let page = pdfDocument?.page(at: currentPageIndex) {
+            // #region agent log - RECT PROBE at end of move
+            debugRectProbe("MOVE_ICON_ENDED", signature: signature, page: page)
+            // #endregion
+            
+            // ✅ CRITICAL: Update payload with exact center ONCE at end (not every frame)
+            if let existing = findAnnotation(for: activeID, page: page) as? ImageStampAnnotation {
+                existing.updatePayload(centerNormalized: signature.center)
+                
+                // #region agent log - RECT PROBE after payload update
+                debugRectProbe("MOVE_ICON_AFTER_PAYLOAD", signature: signature, page: page)
+                // #endregion
+            }
         }
+        
+        // ✅ Clear cache to force selection box recalculation with final position
+        clearScreenRectCache()
         
         hasPendingChangesSubject.send(true)
         renderSignatureOverlays()  // Only render once at end
@@ -1912,7 +1940,19 @@ extension PDFSignatureEditorController: UIGestureRecognizerDelegate {
     func endRotateSignature() {
         isRotatingSignature = false
         isInGesture = false  // ✅ Clear gesture flag
+        clearScreenRectCache()  // ✅ Clear cache when rotation ends
+        
+        // ✅ Update payload once at end
+        if let activeID = activeSignatureID,
+           let signature = getSignature(id: activeID, pageIndex: currentPageIndex),
+           let page = pdfDocument?.page(at: currentPageIndex) {
+            if let existing = findAnnotation(for: activeID, page: page) as? ImageStampAnnotation {
+                existing.updatePayload(centerNormalized: signature.center)
+            }
+        }
+        
         hasPendingChangesSubject.send(true)
+        renderSignatureOverlays()
     }
     
     /// Resize active signature by scale factor
@@ -1926,11 +1966,6 @@ extension PDFSignatureEditorController: UIGestureRecognizerDelegate {
             isInGesture = true  // ✅ Mark that we're in a gesture to use cache
             registerUndoSnapshot(for: currentPageIndex)
             isResizingSignature = true
-            // Cache the initial rect to prevent jittering
-            if let initialRect = getActiveSignatureScreenRect() {
-                cachedScreenRect = initialRect
-                cachedScreenRectSignatureID = activeID
-            }
         }
         
         // Update width ratio (normalized)
@@ -1943,24 +1978,29 @@ extension PDFSignatureEditorController: UIGestureRecognizerDelegate {
                 pageSignatures[index] = signature
                 signatures[currentPageIndex] = pageSignatures
                 
-                // ✅ If committed, update annotation bounds directly (no remove/add - prevents bouncing)
+                // ✅ CRITICAL FIX: Recalculate screen rect from model (prevents jitter from accumulated deltas)
+                let modelRect = signature.pdfRect(for: page)
+                let modelScreenRect = PDFCoordinateConverter.pdfRectToView(modelRect, page: page, pdfView: pdfView)
+                cachedScreenRect = modelScreenRect
+                cachedScreenRectSignatureID = activeID
+                
+                // ✅ If committed, update annotation bounds directly
                 if signature.isCommitted,
                    let existing = findAnnotation(for: activeID, page: page) as? ImageStampAnnotation {
-                    // Update bounds and metadata directly (same as pan/rotation gestures)
                     updateAnnotationBounds(existing, for: signature, page: page)
                     existing.originalRotation = signature.rotation
                     existing.originalColor = signature.color
                     existing.originalAspectRatio = signature.aspectRatio
                     existing.originalWidthRatio = signature.widthRatio
-                    // ✅ During resize: Only update bounds + metadata + redraw (no payload update - too expensive per frame)
                     pdfView.setNeedsDisplay()
+                } else {
+                    // ✅ For uncommitted, update overlay
+                    renderSignatureOverlays()
                 }
             }
         }
         
         hasPendingChangesSubject.send(true)
-        // ✅ CRITICAL: Don't call renderSignatureOverlays() on every resize - too expensive and causes jittering
-        // renderSignatureOverlays() - REMOVED: Only needed for uncommitted signatures
     }
     
     func endResizeSignature() {
@@ -1972,9 +2012,18 @@ extension PDFSignatureEditorController: UIGestureRecognizerDelegate {
         // ✅ CRITICAL: Update payload with exact center ONCE at end (not every frame)
         if let activeID = activeSignatureID,
            let signature = getSignature(id: activeID, pageIndex: currentPageIndex),
-           let page = pdfDocument?.page(at: currentPageIndex),
-           let existing = findAnnotation(for: activeID, page: page) as? ImageStampAnnotation {
-            existing.updatePayload(centerNormalized: signature.center)
+           let page = pdfDocument?.page(at: currentPageIndex) {
+            // #region agent log - RECT PROBE at end of resize
+            debugRectProbe("RESIZE_ENDED", signature: signature, page: page)
+            // #endregion
+            
+            if let existing = findAnnotation(for: activeID, page: page) as? ImageStampAnnotation {
+                existing.updatePayload(centerNormalized: signature.center)
+                
+                // #region agent log - RECT PROBE after payload update
+                debugRectProbe("RESIZE_AFTER_PAYLOAD", signature: signature, page: page)
+                // #endregion
+            }
         }
         
         hasPendingChangesSubject.send(true)
@@ -1989,6 +2038,7 @@ extension PDFSignatureEditorController: UIGestureRecognizerDelegate {
         
         // Register undo snapshot on first rotate
         if !isRotatingSignature {
+            isInGesture = true  // ✅ Mark that we're in a gesture
             registerUndoSnapshot(for: currentPageIndex)
             isRotatingSignature = true
         }
@@ -2001,24 +2051,29 @@ extension PDFSignatureEditorController: UIGestureRecognizerDelegate {
                 pageSignatures[index] = signature
                 signatures[currentPageIndex] = pageSignatures
                 
-                // ✅ If committed, update annotation with remove/add invalidation
+                // ✅ CRITICAL FIX: Recalculate screen rect from model (prevents jitter)
+                let modelRect = signature.pdfRect(for: page)
+                let modelScreenRect = PDFCoordinateConverter.pdfRectToView(modelRect, page: page, pdfView: pdfView)
+                cachedScreenRect = modelScreenRect
+                cachedScreenRectSignatureID = activeID
+                
+                // ✅ If committed, update annotation
                 if signature.isCommitted,
                    let existing = findAnnotation(for: activeID, page: page) as? ImageStampAnnotation {
-                    // Update bounds and metadata
                     updateAnnotationBounds(existing, for: signature, page: page)
                     existing.originalRotation = signature.rotation
                     existing.originalColor = signature.color
                     existing.originalAspectRatio = signature.aspectRatio
                     existing.originalWidthRatio = signature.widthRatio
-                    // ✅ During rotate: Only update bounds + metadata + redraw (no payload update - too expensive per frame)
                     pdfView.setNeedsDisplay()
+                } else {
+                    // ✅ For uncommitted, update overlay
+                    renderSignatureOverlays()
                 }
             }
         }
         
         hasPendingChangesSubject.send(true)
-        // ✅ CRITICAL: Don't render overlays on every rotate call - too expensive
-        // renderSignatureOverlays() - REMOVED: Only needed for uncommitted signatures
     }
     
     // MARK: - Overlay Rendering

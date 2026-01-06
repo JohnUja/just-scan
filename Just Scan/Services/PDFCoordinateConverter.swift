@@ -235,23 +235,29 @@ class PDFCoordinateConverter {
     }
     
     /// Clamp a rect to page bounds, ensuring it stays within the page
+    /// ✅ CRITICAL FIX: Shift-only clamping (prevents box morphing and signature bouncing)
     /// - Parameters:
     ///   - pdfRect: Rect in PDF coordinate space
     ///   - page: The PDF page
-    /// - Returns: Clamped rect within page bounds
+    /// - Returns: Clamped rect within page bounds (shifted, NOT resized)
     static func clampRectToPageBounds(_ pdfRect: CGRect, page: PDFPage) -> CGRect {
         let bounds = page.bounds(for: .mediaBox)
-        let clampedX = max(0, min(bounds.width - pdfRect.width, pdfRect.origin.x))
-        let clampedY = max(0, min(bounds.height - pdfRect.height, pdfRect.origin.y))
-        let clampedWidth = min(pdfRect.width, bounds.width - clampedX)
-        let clampedHeight = min(pdfRect.height, bounds.height - clampedY)
         
-        return CGRect(
-            x: clampedX,
-            y: clampedY,
-            width: clampedWidth,
-            height: clampedHeight
-        )
+        // If rect is bigger than the page, then yes — it must shrink.
+        // But for normal signatures, it shouldn't ever be bigger, so this is rare.
+        var w = min(pdfRect.width, bounds.width)
+        var h = min(pdfRect.height, bounds.height)
+        
+        var x = pdfRect.origin.x
+        var y = pdfRect.origin.y
+        
+        // ✅ CRITICAL: Shift rect inside bounds WITHOUT changing size (prevents morphing/bouncing)
+        if x < bounds.minX { x = bounds.minX }
+        if y < bounds.minY { y = bounds.minY }
+        if x + w > bounds.maxX { x = bounds.maxX - w }
+        if y + h > bounds.maxY { y = bounds.maxY - h }
+        
+        return CGRect(x: x, y: y, width: w, height: h)
     }
 }
 
