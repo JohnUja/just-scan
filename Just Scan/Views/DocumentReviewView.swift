@@ -112,7 +112,7 @@ struct DocumentReviewView: View {
             contentBody
                 .navigationTitle(navigationTitle)
                 .navigationBarTitleDisplayMode(.inline)
-                .toolbar { toolbarContent }
+        .toolbar { toolbarContent }
                 .interactiveDismissDisabled(true)
                 .sheet(isPresented: $showSignatureCanvas) {
                     SignatureCanvasView(onSave: {
@@ -224,7 +224,7 @@ struct DocumentReviewView: View {
     
     @ViewBuilder
     private var contentBody: some View {
-        ZStack {
+            ZStack {
             viewerContent
             if ocrCoordinator.isProcessing {
                 VStack {
@@ -248,12 +248,13 @@ struct DocumentReviewView: View {
     
     @ViewBuilder
     private var viewerContent: some View {
-        if let pdfDocument = pdfDocument {
-            VStack(spacing: 0) {
+                if let pdfDocument = pdfDocument {
+                    VStack(spacing: 0) {
                 GeometryReader { geometry in
-                    ZStack {
+                        ZStack {
                         PDFEditorRepresentable(
                             pdfDocument: pdfDocument,
+                            document: document,  // For JSON-based signature persistence
                             signatures: $signatures,
                             currentPageIndex: $currentPageIndex,
                             activeSignatureID: $activeSignatureID,
@@ -415,77 +416,77 @@ struct DocumentReviewView: View {
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
         if hasPendingChanges {
-            ToolbarItemGroup(placement: .navigationBarLeading) {
+                    ToolbarItemGroup(placement: .navigationBarLeading) {
                 Button(action: { editorProxy.undo() }) {
-                    Image(systemName: "arrow.uturn.backward.circle")
-                }
+                            Image(systemName: "arrow.uturn.backward.circle")
+                        }
                 .disabled(!editorProxy.canUndo)
-                
+                        
                 Button(action: { editorProxy.redo() }) {
-                    Image(systemName: "arrow.uturn.forward.circle")
-                }
+                            Image(systemName: "arrow.uturn.forward.circle")
+                        }
                 .disabled(!editorProxy.canRedo)
-            }
-            
-            ToolbarItemGroup(placement: .navigationBarTrailing) {
+                    }
+                    
+                    ToolbarItemGroup(placement: .navigationBarTrailing) {
                 Button(action: {
                     let imageID = signatureService.currentSignatureID?.uuidString
                     editorProxy.addNewSignature(imageID: imageID)
                 }) {
-                    Image(systemName: "plus.circle")
-                }
-                Button("Save") {
+                            Image(systemName: "plus.circle")
+                        }
+                        Button("Save") {
                     editorProxy.commitAllToPDF()
                     _ = editorProxy.saveToDisk(url: document.fileURL)
                     editorProxy.selectSignature(nil)
                     hasPendingChanges = false
-                }
-                .fontWeight(.semibold)
+                        }
+                        .fontWeight(.semibold)
                 
                 Button("Done") {
                     showExitPrompt = true
                 }
-            }
-        } else {
-            ToolbarItem(placement: .navigationBarLeading) {
-                Button("Done") {
+                    }
+                } else {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Done") {
                     editorProxy.commitAllToPDF()
                     _ = editorProxy.saveToDisk(url: document.fileURL)
-                    dismiss()
+                        dismiss()
+                    }
                 }
-            }
-            
+                
             if pdfDocument?.pageCount ?? 0 > 1 {
-                ToolbarItem(placement: .principal) {
+                    ToolbarItem(placement: .principal) {
                     Text("\(currentPageIndex + 1) / \(pdfDocument?.pageCount ?? 0)")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
                 }
-            }
-            
-            ToolbarItemGroup(placement: .navigationBarTrailing) {
-                Button { performOCR() } label: { Image(systemName: "text.viewfinder") }
-                    .disabled(ocrCoordinator.isProcessing)
                 
-                Button { showSignatureOptions = true } label: { Image(systemName: "signature") }
-                
-                Menu {
-                    Section("Export Options") {
+                ToolbarItemGroup(placement: .navigationBarTrailing) {
+                    Button { performOCR() } label: { Image(systemName: "text.viewfinder") }
+                        .disabled(ocrCoordinator.isProcessing)
+                    
+                    Button { showSignatureOptions = true } label: { Image(systemName: "signature") }
+                    
+                    Menu {
+                        Section("Export Options") {
                         Button { secureAndShare() } label: {
                             Label("Share Secured PDF", systemImage: "square.and.arrow.up")
                         }
                         Button { secureAndShareFlattened() } label: {
-                            Label("Share Flattened PDF", systemImage: "square.and.arrow.up.on.square.fill")
+                                Label("Share Flattened PDF", systemImage: "square.and.arrow.up.on.square.fill")
+                            }
                         }
-                    }
-                    Section("Document Tools") {
-                        Button("Filters", systemImage: "slider.horizontal.3") {
-                            showFilterOptions = true
+                        Section("Document Tools") {
+                            Button("Filters", systemImage: "slider.horizontal.3") {
+                                showFilterOptions = true
+                            }
                         }
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
                     }
-                } label: {
-                    Image(systemName: "ellipsis.circle")
-                }
             }
         }
     }
@@ -563,7 +564,7 @@ struct DocumentReviewView: View {
     }
     
     private func applyFilter(_ filterType: FilterType) {
-        selectedFilter = filterType
+            selectedFilter = filterType
         editorProxy.setVisualFilter(filterType)
     }
     
@@ -588,79 +589,51 @@ struct DocumentReviewView: View {
     }
     
     private func performSecureShare() {
-        // #region agent log
-        DebugLogger.shared.logEntry("performSecureShare", params: [
-            "pageCount": pdfDocument?.pageCount ?? 0,
-            "hasPendingChanges": hasPendingChanges
-        ], hypothesisId: "SHARE")
-        // #endregion
-        
         guard let pdfDoc = pdfDocument else {
-            // #region agent log
-            DebugLogger.shared.logHypothesis("SHARE", message: "❌ No PDF document to share", data: [:])
-            // #endregion
+            print("❌ No PDF document to share")
             return
         }
-        let securedPDF = PDFDocument()
-        for pageIndex in 0..<pdfDoc.pageCount {
-            if let page = pdfDoc.page(at: pageIndex) {
-                securedPDF.insert(page, at: securedPDF.pageCount)
-            }
+        
+        // ARCHITECTURE: Use SignatureExportService to create annotations with payload
+        guard let exportData = SignatureExportService.shared.exportSecure(
+            pdfDocument: pdfDoc,
+            signatures: signatures
+        ),
+        let exportDoc = PDFDocument(data: exportData) else {
+            print("❌ Failed to create secure export")
+            return
         }
         
-        // #region agent log
-        DebugLogger.shared.log(
-            location: "DocumentReviewView.swift:performSecureShare",
-            message: "Created secured PDF",
-            data: [
-                "pageCount": securedPDF.pageCount,
-                "annotationCount": securedPDF.page(at: 0)?.annotations.count ?? 0
-            ],
-            hypothesisId: "SHARE"
-        )
-        // #endregion
-        
-        sharePDF(securedPDF, mode: "secured")
+        print("✅ Created secure PDF with \(signatures.values.reduce(0) { $0 + $1.count }) signatures")
+        sharePDF(exportDoc, mode: "secured")
     }
     
     private func performFlattenedShare() {
-        // #region agent log
-        DebugLogger.shared.logEntry("performFlattenedShare", params: [
-            "pageCount": pdfDocument?.pageCount ?? 0,
-            "filterType": selectedFilter.rawValue,
-            "hasPendingChanges": hasPendingChanges
-        ], hypothesisId: "SHARE")
-        // #endregion
-        
         guard let pdfDoc = pdfDocument else {
-            // #region agent log
-            DebugLogger.shared.logHypothesis("SHARE", message: "❌ No PDF document to share", data: [:])
-            // #endregion
-            return
-        }
-        let documentService = DocumentService.shared
-        guard let flattened = documentService.flattenAndCompress(pdfDocument: pdfDoc) else {
-            // #region agent log
-            DebugLogger.shared.logHypothesis("SHARE", message: "❌ Failed to flatten PDF", data: [:])
-            // #endregion
+            print("❌ No PDF document to share")
             return
         }
         
-        let exportDoc: PDFDocument = (selectedFilter == .color) ? flattened : documentService.applyFilter(to: flattened, filterType: selectedFilter)
+        // ARCHITECTURE: Use SignatureExportService to render signatures into page pixels
+        guard let exportData = SignatureExportService.shared.exportFlattened(
+            pdfDocument: pdfDoc,
+            signatures: signatures
+        ),
+        let exportDoc = PDFDocument(data: exportData) else {
+            print("❌ Failed to create flattened export")
+            return
+        }
         
-        // #region agent log
-        DebugLogger.shared.log(
-            location: "DocumentReviewView.swift:performFlattenedShare",
-            message: "Created flattened PDF",
-            data: [
-                "pageCount": exportDoc.pageCount,
-                "filterType": selectedFilter.rawValue
-            ],
-            hypothesisId: "SHARE"
-        )
-        // #endregion
+        // Optionally apply filter
+        let finalDoc: PDFDocument
+        if selectedFilter == .color {
+            finalDoc = exportDoc
+        } else {
+            finalDoc = DocumentService.shared.applyFilter(to: exportDoc, filterType: selectedFilter)
+        }
         
-        sharePDF(exportDoc, mode: "flattened")
+        print("✅ Created flattened PDF with \(signatures.values.reduce(0) { $0 + $1.count }) signatures")
+        sharePDF(finalDoc, mode: "flattened")
     }
     
     private func sharePDF(_ pdfDocument: PDFDocument, mode: String) {
@@ -680,17 +653,17 @@ struct DocumentReviewView: View {
             return
         }
         
-        // #region agent log
+                                        // #region agent log
         DebugLogger.shared.log(
             location: "DocumentReviewView.swift:sharePDF",
             message: "PDF written to temp file",
-            data: [
+                                            data: [
                 "tempURL": tempURL.path,
                 "fileExists": FileManager.default.fileExists(atPath: tempURL.path)
             ],
             hypothesisId: "SHARE"
-        )
-        // #endregion
+                                        )
+                                        // #endregion
         
         let activityVC = UIActivityViewController(activityItems: [tempURL], applicationActivities: nil)
         if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,

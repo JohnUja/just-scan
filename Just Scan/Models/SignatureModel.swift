@@ -4,14 +4,22 @@
 //
 //  UNIFIED STRUCTURE: Single source of truth for signature state
 //
+//  ARCHITECTURE NOTE (SwiftUI Overlay Migration):
+//  - This model is the ONLY source of truth for signature geometry
+//  - Persistence: JSON via DocumentSignatureStore (NOT PDF annotations)
+//  - PDF annotations are ONLY used for export, never for runtime editing
+//
 
 import Foundation
 import UIKit
 import PDFKit
 
-/// Unified signature model that works with both overlay rendering and PDF annotations
-/// Uses NORMALIZED coordinates (0...1) for consistency across different page sizes
-struct SignatureModel: Identifiable, Equatable {
+/// Unified signature model that works with SwiftUI overlay rendering.
+/// Uses NORMALIZED coordinates (0...1) for consistency across different page sizes.
+///
+/// CRITICAL: This is the single source of truth. During editing, ONLY update this model.
+/// PDF annotations are created only at export time, never during editing.
+struct SignatureModel: Identifiable, Equatable, Codable {
     let id: UUID
     
     /// Normalized center point (0...1, bottom-left origin like PDF)
@@ -32,10 +40,12 @@ struct SignatureModel: Identifiable, Equatable {
     /// Aspect ratio (width / height)
     let aspectRatio: CGFloat
     
-    /// Whether this signature has been committed to PDF
+    /// DEPRECATED: In the new architecture, all signatures are "uncommitted" until export.
+    /// Kept for backward compatibility during migration.
     var isCommitted: Bool
     
-    /// Annotation ID (if committed)
+    /// DEPRECATED: No annotation IDs in the new architecture.
+    /// Kept for backward compatibility during migration.
     var annotationID: String?
     
     init(id: UUID = UUID(),
@@ -56,6 +66,39 @@ struct SignatureModel: Identifiable, Equatable {
         self.aspectRatio = aspectRatio
         self.isCommitted = isCommitted
         self.annotationID = annotationID
+    }
+    
+    // MARK: - Codable
+    
+    enum CodingKeys: String, CodingKey {
+        case id, center, widthRatio, rotation, color, imageID, aspectRatio
+        // Note: isCommitted and annotationID are NOT persisted (deprecated)
+    }
+    
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        center = try container.decode(CGPoint.self, forKey: .center)
+        widthRatio = try container.decode(CGFloat.self, forKey: .widthRatio)
+        rotation = try container.decode(CGFloat.self, forKey: .rotation)
+        color = try container.decode(SignatureColor.self, forKey: .color)
+        imageID = try container.decode(String.self, forKey: .imageID)
+        aspectRatio = try container.decode(CGFloat.self, forKey: .aspectRatio)
+        // Deprecated fields default to false/nil
+        isCommitted = false
+        annotationID = nil
+    }
+    
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(center, forKey: .center)
+        try container.encode(widthRatio, forKey: .widthRatio)
+        try container.encode(rotation, forKey: .rotation)
+        try container.encode(color, forKey: .color)
+        try container.encode(imageID, forKey: .imageID)
+        try container.encode(aspectRatio, forKey: .aspectRatio)
+        // Note: isCommitted and annotationID are NOT encoded (deprecated)
     }
     
     // MARK: - PDF Rect Conversion Helpers
@@ -94,8 +137,13 @@ struct SignatureModel: Identifiable, Equatable {
         widthRatio = rect.width / pageBounds.width
     }
     
-    // MARK: - Loading from Annotation
+    // MARK: - Loading from Annotation (IMPORT ONLY)
     
+    /// Reconstruct a SignatureModel from a PDF annotation.
+    /// 
+    /// IMPORTANT: This method is ONLY used for importing PDFs that contain our payload.
+    /// During normal editing, signatures are NEVER loaded from annotations.
+    /// Use DocumentSignatureStore.loadSignatures() instead.
     @MainActor
     static func fromAnnotation(_ annotation: PDFAnnotation, page: PDFPage) -> SignatureModel? {
         // CRITICAL: Check if this is our signature annotation (multiple ways for reliability)

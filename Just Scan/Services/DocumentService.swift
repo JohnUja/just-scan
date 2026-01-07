@@ -140,12 +140,12 @@ class DocumentService: ObservableObject {
     
     private func applyFilter(to image: UIImage, filterType: FilterType) -> UIImage {
         guard let cgImage = image.cgImage else { return image }
-
+        
         let context = CIContext(options: [.useSoftwareRenderer: false])
         let ciImage = CIImage(cgImage: cgImage)
-
+        
         let filteredCIImage: CIImage
-
+        
         switch filterType {
         case .blackAndWhite:
             guard let controls = CIFilter(name: "CIColorControls") else { return image }
@@ -154,18 +154,18 @@ class DocumentService: ObservableObject {
             controls.setValue(0.0, forKey: kCIInputSaturationKey)
             controls.setValue(0.1, forKey: kCIInputBrightnessKey)
             filteredCIImage = controls.outputImage ?? ciImage
-
+            
         case .grayscale:
             guard let controls = CIFilter(name: "CIColorControls") else { return image }
             controls.setValue(ciImage, forKey: kCIInputImageKey)
             controls.setValue(0.0, forKey: kCIInputSaturationKey)
             controls.setValue(1.1, forKey: kCIInputContrastKey)
             filteredCIImage = controls.outputImage ?? ciImage
-
+            
         case .color:
             return image
         }
-
+        
         guard let outputCGImage = context.createCGImage(filteredCIImage, from: filteredCIImage.extent) else {
             return image
         }

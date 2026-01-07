@@ -2,6 +2,11 @@
 //  Document.swift
 //  Just Scan - ENHANCED
 //
+//  ARCHITECTURE NOTE (SwiftUI Overlay Migration):
+//  - Document identity is provided by app-generated `id` (UUID), NOT PDF hashing
+//  - Signature placements are stored in JSON at `signatureStorageURL`
+//  - The PDF file itself is NOT modified during editing (only at export)
+//
 
 import Foundation
 import UIKit
@@ -18,6 +23,17 @@ struct Document: Identifiable, Codable {
     var fileSize: Int64?
     var lastModified: Date?
     var thumbnailURL: URL?
+    
+    // MARK: - Signature Storage
+    
+    /// URL to the signature placements JSON file for this document.
+    /// Path: Documents/SignatureData/{documentID}/placements.json
+    var signatureStorageURL: URL {
+        let documentsDirectory = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let signatureDataDirectory = documentsDirectory.appendingPathComponent("SignatureData", isDirectory: true)
+        let documentDirectory = signatureDataDirectory.appendingPathComponent(id.uuidString, isDirectory: true)
+        return documentDirectory.appendingPathComponent("placements.json")
+    }
     
     init(id: UUID = UUID(), fileName: String, createdAt: Date = Date(), fileURL: URL) {
         self.id = id

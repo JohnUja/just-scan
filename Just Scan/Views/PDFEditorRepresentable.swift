@@ -12,8 +12,11 @@ import Combine
 
 /// SwiftUI wrapper for PDFSignatureEditorController
 /// Bridges UIKit PDF editor to SwiftUI
+///
+/// ARCHITECTURE: Signatures are loaded from JSON store (via Document), not PDF annotations.
 struct PDFEditorRepresentable: UIViewControllerRepresentable {
     let pdfDocument: PDFDocument
+    let document: Document?  // For signature JSON persistence
     @Binding var signatures: [Int: [SignatureModel]]
     @Binding var currentPageIndex: Int
     @Binding var activeSignatureID: UUID?
@@ -28,7 +31,9 @@ struct PDFEditorRepresentable: UIViewControllerRepresentable {
     
     func makeUIViewController(context: Context) -> PDFSignatureEditorController {
         let controller = PDFSignatureEditorController()
-        controller.loadDocument(pdfDocument)
+        
+        // ARCHITECTURE: Pass document for JSON-based signature loading
+        controller.loadDocument(pdfDocument, document: document)
         
         // Store controller in proxy if provided
         controllerProxy?.controller = controller
@@ -37,8 +42,7 @@ struct PDFEditorRepresentable: UIViewControllerRepresentable {
         // Subscribe to Combine publishers
         context.coordinator.setupSubscriptions(controller: controller)
         
-        // ✅ CRITICAL: Sync initial state after subscriptions are set up
-        // This ensures SwiftUI receives signatures loaded by loadDocument()
+        // Sync initial state after subscriptions are set up
         DispatchQueue.main.async {
             context.coordinator.syncInitialState(from: controller)
         }

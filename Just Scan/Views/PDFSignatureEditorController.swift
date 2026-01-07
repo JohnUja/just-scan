@@ -123,6 +123,12 @@ class PDFSignatureEditorController: UIViewController {
     /// SignatureService reference
     private let signatureService = SignatureService.shared
     
+    /// DocumentSignatureStore reference for JSON persistence
+    private let signatureStore = DocumentSignatureStore.shared
+    
+    /// Current document being edited (needed for signature storage)
+    private var currentDocument: Document?
+    
     /// Overlay layer for uncommitted signatures
     private var overlayLayer: CALayer?
     
@@ -214,16 +220,31 @@ class PDFSignatureEditorController: UIViewController {
     // MARK: - Public Interface
     
     /// Load a PDF document
-    func loadDocument(_ document: PDFDocument) {
-        // pdfDocument is a computed property (get-only), so we just set pdfView.document
-        pdfView.document = document
+    /// - Parameter pdfDoc: The PDFDocument to display
+    /// - Parameter document: The Document model (for signature storage)
+    func loadDocument(_ pdfDoc: PDFDocument, document: Document? = nil) {
+        // Store document reference for signature persistence
+        currentDocument = document
         
-        if let page = document.page(at: currentPageIndex) {
+        // pdfDocument is a computed property (get-only), so we just set pdfView.document
+        pdfView.document = pdfDoc
+        
+        if let page = pdfDoc.page(at: currentPageIndex) {
             pdfView.go(to: page)
         }
         
-        // Load existing signatures from annotations
-        loadSignaturesFromAnnotations()
+        // ARCHITECTURE: Load signatures from JSON store (NOT from PDF annotations)
+        // PDF annotations are ONLY used for export, never for runtime editing
+        if let doc = document {
+            signatures = signatureStore.loadSignatures(for: doc)
+            signaturesSubject.send(signatures)
+            print("✅ Loaded \(signatures.values.reduce(0) { $0 + $1.count }) signatures from JSON store")
+        } else {
+            // Fallback: Load from annotations (for backward compatibility during migration)
+            loadSignaturesFromAnnotations()
+        }
+        
+        renderSignatureOverlays()
     }
     
     /// Get current state for SwiftUI synchronization
@@ -420,23 +441,8 @@ class PDFSignatureEditorController: UIViewController {
             return
         }
         
-        // #region agent log
-        let oldColor = signature.color
-        let oldCenter = signature.center
-        let oldRotation = signature.rotation
-        DebugLogger.shared.log(
-            location: "PDFSignatureEditorController.swift:\(#line)",
-            message: "Before color change",
-            data: [
-                "oldColor": oldColor.rawValue,
-                "center": "\(oldCenter)",
-                "rotation": oldRotation,
-                "isCommitted": signature.isCommitted
-            ],
-            hypothesisId: "COLOR"
-        )
-        // #endregion
-        
+        // ARCHITECTURE: In the new SwiftUI overlay system, we just update the model
+        // No PDF annotations are touched during editing
         signature.color = color
         
         // Update in array
@@ -447,263 +453,54 @@ class PDFSignatureEditorController: UIViewController {
             }
         }
         
-        // If committed, update annotation
-        if signature.isCommitted,
-           let page = pdfDocument?.page(at: currentPageIndex) {
-            // ✅ CRITICAL: Ensure annotation is updated without remove/add to prevent visual flipping
-            if let existing = findAnnotation(for: signature.id, page: page) as? ImageStampAnnotation {
-                // #region agent log - Track color change and annotation state
-                let oldRotation = existing.originalRotation
-                let oldColor = existing.originalColor
-                let oldBounds = existing.bounds
-                
-                // Log before color change to track CTM/state
-                DebugLogger.shared.log(
-                    location: "PDFSignatureEditorController.swift:changeActiveSignatureColor",
-                    message: "BEFORE color change - annotation state",
-                    data: [
-                        "sigID": signature.id.uuidString,
-                        "oldColor": oldColor.rawValue,
-                        "newColor": color.rawValue,
-                        "oldRotation": oldRotation,
-                        "oldBounds": "\(oldBounds)",
-                        "isCommitted": signature.isCommitted
-                    ],
-                    hypothesisId: "COLOR"
-                )
-                // #endregion
-                // ✅ STRATEGY A: Do NOT pre-tint - only update color metadata
-                // The draw() method will tint the base image on every redraw
-                // This prevents double-tinting and ensures consistent colors
-                
-                // Ensure baseImageData exists (for clean retinting)
-                if existing.baseImageData == nil {
-                    // If baseImageData is missing, fetch original from SignatureService
-                    if let uuid = UUID(uuidString: signature.imageID),
-                       let savedSignature = signatureService.signatureHistory.first(where: { $0.id == uuid }) {
-                        existing.baseImageData = savedSignature.image.pngData()
-                        // Also update storedImageData to base for backward compatibility
-                        existing.storedImageData = savedSignature.image.pngData()
-                    } else if let currentImage = existing.baseImage {
-                        // Fallback: use current image as base
-                        existing.baseImageData = currentImage.pngData()
-                    }
-                }
-                
-                // ✅ CRITICAL: Do NOT write tinted image to storedImageData
-                // storedImageData should remain base (untinted) - draw() will tint it
-                
-                // #region agent log
-                let beforeBounds = existing.bounds
-                let beforeRotation = existing.originalRotation
-                let beforeColor = existing.originalColor
-                let hasBaseImageData = existing.baseImageData != nil
-                let baseImageSize = existing.baseImage?.size
-                DebugLogger.shared.log(
-                    location: "PDFSignatureEditorController.swift:changeActiveSignatureColor",
-                    message: "Before annotation update",
-                    data: [
-                        "beforeBounds": "\(beforeBounds)",
-                        "beforeRotation": beforeRotation,
-                        "beforeColor": beforeColor.rawValue,
-                        "hasBaseImageData": hasBaseImageData,
-                        "baseImageSize": baseImageSize != nil ? "\(baseImageSize!)" : "nil"
-                    ],
-                    hypothesisId: "COLOR"
-                )
-                // #endregion
-                
-                // Update metadata only (bounds, rotation, color)
-                updateAnnotationBounds(existing, for: signature, page: page)
-                existing.originalRotation = signature.rotation
-                existing.originalColor = signature.color
-                existing.originalAspectRatio = signature.aspectRatio
-                existing.originalWidthRatio = signature.widthRatio
-                
-                // #region agent log
-                DebugLogger.shared.log(
-                    location: "PDFSignatureEditorController.swift:changeActiveSignatureColor",
-                    message: "After annotation metadata update",
-                    data: [
-                        "afterBounds": "\(existing.bounds)",
-                        "afterRotation": existing.originalRotation,
-                        "afterColor": existing.originalColor.rawValue,
-                        "boundsChanged": beforeBounds != existing.bounds,
-                        "rotationChanged": beforeRotation != existing.originalRotation
-                    ],
-                    hypothesisId: "COLOR"
-                )
-                // #endregion
-                
-                // ✅ CRITICAL: Regenerate payload with new image data AND exact center
-                existing.updatePayload(centerNormalized: signature.center)
-                // ✅ Force redraw without remove/add (prevents visual rotation/flip)
-                pdfView.setNeedsDisplay()
-                // ✅ Clear cache to ensure selection box updates
-                clearScreenRectCache()
-                
-                // #region agent log
-                DebugLogger.shared.logExit("changeActiveSignatureColor", result: [
-                    "finalBounds": "\(existing.bounds)",
-                    "finalRotation": existing.originalRotation,
-                    "finalColor": existing.originalColor.rawValue
-                ], hypothesisId: "COLOR")
-                // #endregion
-            } else {
-                // Only create new if doesn't exist
-                upsertAnnotation(for: signature, on: page)
-            }
-        }
-        
-        // #region agent log
-        DebugLogger.shared.log(
-            location: "PDFSignatureEditorController.swift:\(#line)",
-            message: "After color change",
-            data: [
-                "newColor": signature.color.rawValue,
-                "center": "\(signature.center)",
-                "rotation": signature.rotation,
-                "centerChanged": signature.center != oldCenter,
-                "rotationChanged": signature.rotation != oldRotation
-            ],
-            hypothesisId: "COLOR"
-        )
-        // #endregion
-        
+        // Re-render overlays with new color
         renderSignatureOverlays()
         
         hasPendingChangesSubject.send(true)
     }
     
-    /// Commit all signatures to PDF annotations
+    /// DEPRECATED: In the new architecture, signatures are NOT committed to PDF during editing.
+    /// Use SignatureExportService.exportFlattened() or exportSecure() instead.
+    /// This method is kept for backward compatibility but does nothing.
+    @available(*, deprecated, message: "Use SignatureExportService for export instead")
     func commitAllToPDF() {
-        guard let document = pdfDocument else { return }
-        
-        for (pageIndex, pageSignatures) in signatures {
-            guard let page = document.page(at: pageIndex) else { continue }
-            
-            var updated = pageSignatures
-            for i in updated.indices {
-                var sig = updated[i]
-                
-                // Upsert: update existing or create new
-                upsertAnnotation(for: sig, on: page)
-                
-                sig.isCommitted = true
-                sig.annotationID = sig.id.uuidString
-                updated[i] = sig
-            }
-            signatures[pageIndex] = updated
-        }
-        
+        // NO-OP in the new architecture
+        // Signatures are persisted in JSON, not PDF annotations
+        // PDF is only modified during export
+        print("⚠️ commitAllToPDF() is deprecated - use SignatureExportService instead")
         renderSignatureOverlays()
     }
     
-    /// Save PDF to disk
+    /// Save signatures to JSON store (does NOT modify the PDF file)
+    /// The PDF file is only modified during export (flatten or secure)
     func saveToDisk(url: URL) -> Bool {
-        guard let document = pdfDocument else { return false }
+        guard let doc = currentDocument else {
+            print("❌ No document reference - cannot save signatures")
+            return false
+        }
         
-        print("💾 === SAVING TO DISK ===")
+        print("💾 === SAVING SIGNATURES TO JSON ===")
         
-        // Commit everything
-        commitAllToPDF()
+        // ARCHITECTURE: Save signatures to JSON store, NOT to PDF annotations
+        // PDF file is unchanged - only modified during export
+        let saved = signatureStore.saveSignatures(signatures, for: doc)
         
-        // Write to disk
-        let ok = document.write(to: url)
-        
-        if ok {
-            print("✅ Write successful - reloading annotations")
-            
-            // ✅ CRITICAL FIX: Save activeSignatureID before clearing, so we can restore it after reload
-            let savedActiveID = activeSignatureID
-            
-            // Clear selection temporarily (will restore after reload if signature still exists)
-            activeSignatureID = nil
-            activeSignatureIDSubject.send(nil)
-            
-            // Force reload from disk to sync
-            if let reloaded = PDFDocument(url: url) {
-                pdfView.document = reloaded
-                
-                // Clear and reload model
-                clearAnnotationIDCache()
-                
-                // #region agent log
-                DebugLogger.shared.log(
-                    location: "PDFSignatureEditorController.swift:saveToDisk",
-                    message: "Reloading PDF after save - checking coordinate consistency",
-                    data: [
-                        "pageIndex": currentPageIndex,
-                        "signatureCountBefore": signatures[currentPageIndex]?.count ?? 0,
-                        "savedActiveID": savedActiveID?.uuidString ?? "nil"
-                    ],
-                    hypothesisId: "C"
-                )
-                // #endregion
-                
-                loadSignaturesFromAnnotations()
-                
-                // #region agent log
-                DebugLogger.shared.log(
-                    location: "PDFSignatureEditorController.swift:saveToDisk",
-                    message: "After reload - checking if signatures moved",
-                    data: [
-                        "pageIndex": currentPageIndex,
-                        "signatureCountAfter": signatures[currentPageIndex]?.count ?? 0,
-                        "signatures": signatures[currentPageIndex]?.map { sig in
-                            [
-                                "id": sig.id.uuidString,
-                                "center": "\(sig.center)",
-                                "widthRatio": sig.widthRatio,
-                                "rotation": sig.rotation
-                            ]
-                        } ?? []
-                    ],
-                    hypothesisId: "C"
-                )
-                // #endregion
-                
-                // ✅ CRITICAL FIX: Restore activeSignatureID if the signature still exists after reload
-                if let savedID = savedActiveID,
-                   getSignature(id: savedID, pageIndex: currentPageIndex) != nil {
-                    // Signature still exists - restore selection
-                    activeSignatureID = savedID
-                    activeSignatureIDSubject.send(savedID)
-                    // #region agent log
-                    DebugLogger.shared.log(
-                        location: "PDFSignatureEditorController.swift:saveToDisk",
-                        message: "✅ Restored activeSignatureID after save/reload",
-                        data: [
-                            "restoredID": savedID.uuidString
-                        ],
-                        hypothesisId: "C"
-                    )
-                    // #endregion
-                } else {
-                    // #region agent log
-                    DebugLogger.shared.log(
-                        location: "PDFSignatureEditorController.swift:saveToDisk",
-                        message: "⚠️ Could not restore activeSignatureID - signature not found after reload",
-                        data: [
-                            "savedID": savedActiveID?.uuidString ?? "nil"
-                        ],
-                        hypothesisId: "C"
-                    )
-                    // #endregion
-                }
-            }
-            
+        if saved {
+            print("✅ Signatures saved to JSON store")
             hasPendingChangesSubject.send(false)
             
-            // ✅ Post notification to refresh document thumbnails in HomeView
+            // Refresh overlays to ensure consistency
+            renderSignatureOverlays()
+            
+            // Post notification to refresh document thumbnails in HomeView
             NotificationCenter.default.post(name: NSNotification.Name("RefreshDocumentThumbnails"), object: nil)
             
             print("💾 === SAVE COMPLETE ===")
         } else {
-            print("❌ Write failed")
+            print("❌ Failed to save signatures")
         }
         
-        return ok
+        return saved
     }
     
     /// Undo last action
@@ -720,31 +517,15 @@ class PDFSignatureEditorController: UIViewController {
         signatures[currentPageIndex] = snapshot
         hasPendingChangesSubject.send(true)
         
-        // ✅ CRITICAL: Update committed annotations to reflect undo state
-        if let page = pdfDocument?.page(at: currentPageIndex) {
-            // Remove all existing annotations for this page
-            let existingAnnotations = page.annotations.filter { ann in
-                guard let name = ann.value(forAnnotationKey: .name) as? String,
-                      name == SignatureAnnotationKeys.annotationName else { return false }
-                return true
-            }
-            existingAnnotations.forEach { page.removeAnnotation($0) }
-            
-            // Re-add annotations from snapshot (committed signatures)
-            for signature in snapshot where signature.isCommitted {
-                upsertAnnotation(for: signature, on: page)
-            }
-        }
+        // ARCHITECTURE: No annotation handling - just re-render overlays
+        renderSignatureOverlays()
         
-        // ✅ CRITICAL FIX: Validate signature exists before selecting (prevents ghost selections)
-        // BRAIN LOGIC: Auto-select last modified signature after undo, but only if it exists
+        // Auto-select last modified signature after undo (if it exists)
         if let lastSignature = snapshot.last,
            getSignature(id: lastSignature.id, pageIndex: currentPageIndex) != nil {
-            // Signature exists in current model - safe to select
             activeSignatureID = lastSignature.id
             activeSignatureIDSubject.send(activeSignatureID)
         } else {
-            // No valid signature to select - clear selection
             activeSignatureID = nil
             activeSignatureIDSubject.send(nil)
         }
@@ -769,31 +550,15 @@ class PDFSignatureEditorController: UIViewController {
         signatures[currentPageIndex] = snapshot
         hasPendingChangesSubject.send(true)
         
-        // ✅ CRITICAL: Update committed annotations to reflect redo state
-        if let page = pdfDocument?.page(at: currentPageIndex) {
-            // Remove all existing annotations for this page
-            let existingAnnotations = page.annotations.filter { ann in
-                guard let name = ann.value(forAnnotationKey: .name) as? String,
-                      name == SignatureAnnotationKeys.annotationName else { return false }
-                return true
-            }
-            existingAnnotations.forEach { page.removeAnnotation($0) }
-            
-            // Re-add annotations from snapshot (committed signatures)
-            for signature in snapshot where signature.isCommitted {
-                upsertAnnotation(for: signature, on: page)
-            }
-        }
+        // ARCHITECTURE: No annotation handling - just re-render overlays
+        renderSignatureOverlays()
         
-        // ✅ CRITICAL FIX: Validate signature exists before selecting (prevents ghost selections)
-        // BRAIN LOGIC: Auto-select last modified signature after redo, but only if it exists
+        // Auto-select last modified signature after redo (if it exists)
         if let lastSignature = snapshot.last,
            getSignature(id: lastSignature.id, pageIndex: currentPageIndex) != nil {
-            // Signature exists in current model - safe to select
             activeSignatureID = lastSignature.id
             activeSignatureIDSubject.send(activeSignatureID)
         } else {
-            // No valid signature to select - clear selection
             activeSignatureID = nil
             activeSignatureIDSubject.send(nil)
         }
@@ -1367,55 +1132,23 @@ class PDFSignatureEditorController: UIViewController {
                     pageSignatures[index] = signature
                     signatures[currentPageIndex] = pageSignatures
                     
-                    // #region agent log - RECT PROBE during pan gesture
-                    debugRectProbe("PAN_CHANGED", signature: signature, page: page)
-                    // #endregion
-                    
-                    // ✅ Clear cache when signature position changes (prevents stale cache during drag)
+                    // Clear cache when signature position changes
                     clearScreenRectCache()
-                    
-                    // If committed, update annotation bounds directly (no remove/add)
-                    if signature.isCommitted,
-                       let existing = findAnnotation(for: activeID, page: page) as? ImageStampAnnotation {
-                        updateAnnotationBounds(existing, for: signature, page: page)
-                        pdfView.setNeedsDisplay()
-                    }
                 }
             }
             
-            // ✅ CRITICAL: Don't render overlays on every pan change - too expensive and causes jittering
-            // Only update annotation bounds directly (committed signatures)
-            // renderSignatureOverlays() - REMOVED: Only needed for uncommitted signatures
+            // ARCHITECTURE: No annotation handling during gestures - just update model
+            // SwiftUI overlay will re-render based on model changes
             
         case .ended, .cancelled:
-            // #region agent log
-            DebugLogger.shared.logExit("handlePan", result: [
-                "finalCenter": "\(signature.center)",
-                "isCommitted": signature.isCommitted,
-                "finalPDFRect": "\(signature.pdfRect(for: page))"
-            ], hypothesisId: "MOVE")
-            // #endregion
-            
-            // #region agent log - RECT PROBE at end of drag
-            debugRectProbe("PAN_ENDED", signature: signature, page: page)
-            // #endregion
-            
-            if signature.isCommitted {
-                upsertAnnotation(for: signature, on: page)
-                
-                // #region agent log - RECT PROBE after upsertAnnotation
-                debugRectProbe("PAN_AFTER_UPSERT", signature: signature, page: page)
-                // #endregion
-            }
-            
+            // ARCHITECTURE: No annotation handling - just finalize gesture state
             gestureStartSignatureID = nil
             gestureStartCenter = nil
             gestureStartRect = nil
-            isInGesture = false  // ✅ Clear gesture flag
-            // ✅ Clear cache to force selection box recalculation with new position
+            isInGesture = false
             clearScreenRectCache()
             hasPendingChangesSubject.send(true)
-            renderSignatureOverlays()  // Only render once at end
+            renderSignatureOverlays()
             
         default:
             break
@@ -1507,28 +1240,13 @@ class PDFSignatureEditorController: UIViewController {
             // renderSignatureOverlays() - REMOVED: Only needed for uncommitted signatures
             
         case .ended, .cancelled:
-            // #region agent log
-            DebugLogger.shared.logExit("handlePinch", result: [
-                "finalWidthRatio": signature.widthRatio,
-                "isCommitted": signature.isCommitted
-            ], hypothesisId: "SCALE")
-            // #endregion
-            
-            // ✅ CRITICAL FIX: On pinch .ended, finalize by updating payload once
-            // This is the ONLY place payload should be updated during resize
-            if signature.isCommitted,
-               let page = pdfDocument?.page(at: currentPageIndex),
-               let existing = findAnnotation(for: activeID, page: page) as? ImageStampAnnotation {
-                // Finalize bounds and update payload with exact center
-                upsertAnnotation(for: signature, on: page)
-            }
-            
+            // ARCHITECTURE: No annotation handling - just finalize gesture state
             gestureStartScale = 1.0
             gestureStartRect = nil
-            isInGesture = false  // ✅ Clear gesture flag
-            clearScreenRectCache()  // ✅ Clear cache when resize ends
+            isInGesture = false
+            clearScreenRectCache()
             hasPendingChangesSubject.send(true)
-            renderSignatureOverlays()  // Only render once at end
+            renderSignatureOverlays()
             
         default:
             break
@@ -1579,23 +1297,8 @@ class PDFSignatureEditorController: UIViewController {
                     debugRectProbe("ROTATE_CHANGED", signature: signature, page: page)
                     // #endregion
                     
-                    // ✅ CRITICAL FIX: During rotation .changed, ONLY update rotation and redraw
-                    // Do NOT recompute padded bounds/clamp every frame (causes bouncing/oscillation)
-                    // Do NOT clear cache during rotation - keep cached rect to prevent jittering
-                    // Only update rotation value and trigger redraw
-                    if signature.isCommitted {
-                        // Just update rotation metadata and redraw - no bounds recomputation
-                        if let existing = findAnnotation(for: activeID, page: page) as? ImageStampAnnotation {
-                            existing.originalRotation = signature.rotation
-                            // ✅ CRITICAL: Do NOT call updateAnnotationBounds during rotation - causes bouncing
-                            // The bounds will be recalculated on .ended via upsertAnnotation
-                            pdfView.setNeedsDisplay()
-                        }
-                    }
-                    
-                    // ✅ CRITICAL FIX: Keep cached rect during rotation - rotation doesn't change rect size
-                    // The selection box will rotate via the rotation parameter, not by recalculating rect
-                    // This prevents jittering and bouncing during rotation
+                    // ARCHITECTURE: No annotation handling during gestures
+                    // SwiftUI overlay will re-render based on model changes
                 }
             }
             
@@ -1603,33 +1306,12 @@ class PDFSignatureEditorController: UIViewController {
             // renderSignatureOverlays() - REMOVED: Only needed for uncommitted signatures
             
         case .ended, .cancelled:
-            // #region agent log
-            DebugLogger.shared.logExit("handleRotation", result: [
-                "finalRotation": signature.rotation,
-                "isCommitted": signature.isCommitted
-            ], hypothesisId: "ROTATE")
-            // #endregion
-            
-            // #region agent log - RECT PROBE at end of rotation
-            debugRectProbe("ROTATE_ENDED", signature: signature, page: page)
-            // #endregion
-            
-            // ✅ CRITICAL FIX: On rotation .ended, finalize by recomputing padded bounds once and updating payload
-            // This is the ONLY place bounds and payload should be updated during rotation
-            if signature.isCommitted,
-               let page = pdfDocument?.page(at: currentPageIndex) {
-                upsertAnnotation(for: signature, on: page)  // This calls updatePayload internally
-                
-                // #region agent log - RECT PROBE after upsertAnnotation
-                debugRectProbe("ROTATE_AFTER_UPSERT", signature: signature, page: page)
-                // #endregion
-            }
-            
+            // ARCHITECTURE: No annotation handling - just finalize gesture state
             gestureStartRotation = nil
-            isInGesture = false  // ✅ Clear gesture flag
-            clearScreenRectCache()  // ✅ Clear cache when rotation ends to recalculate with new rotation
+            isInGesture = false
+            clearScreenRectCache()
             hasPendingChangesSubject.send(true)
-            renderSignatureOverlays()  // Only render once at end
+            renderSignatureOverlays()
             
         default:
             break

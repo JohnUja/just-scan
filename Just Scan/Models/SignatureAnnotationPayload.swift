@@ -2,7 +2,15 @@
 //  SignatureAnnotationPayload.swift
 //  Just Scan
 //
-//  Metadata structure for storing signature identity and properties in PDF annotations
+//  Metadata structure for storing signature identity and properties in PDF annotations.
+//
+//  ARCHITECTURE NOTE (SwiftUI Overlay Migration):
+//  This payload is ONLY used for:
+//  - EXPORT: Embedding data in "Share Secure PDF" exports
+//  - IMPORT: Reconstructing SignatureModel when importing a PDF with our annotations
+//
+//  This payload is NEVER used during normal editing.
+//  During editing, use SignatureModel as the single source of truth.
 //
 
 import Foundation

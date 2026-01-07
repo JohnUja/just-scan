@@ -1,14 +1,25 @@
 //
-//  ImageStampAnnotation.swift - DEFINITIVE FIX
+//  ImageStampAnnotation.swift
 //  Just Scan
 //
-//  Fixed drawing to prevent flipping and ensure proper rotation
+//  ARCHITECTURE NOTE (SwiftUI Overlay Migration):
+//  This class is ONLY used during EXPORT (via SignatureExportService).
+//  It is NEVER used during editing. During editing, signatures are:
+//  - Stored in SignatureModel (single source of truth)
+//  - Rendered as SwiftUI overlays
+//  - Persisted in JSON via DocumentSignatureStore
+//
+//  This annotation is created ONLY when:
+//  - User exports with "Share Secure PDF" option
+//  - The annotation contains payload for re-import capability
 //
 
 import PDFKit
 import UIKit
 import Foundation
 
+/// PDF annotation for signature stamps - EXPORT ONLY
+/// Do NOT use during editing. Use SignatureModel + SwiftUI overlays instead.
 class ImageStampAnnotation: PDFAnnotation {
     var originalRotation: CGFloat
     var originalColor: SignatureColor
