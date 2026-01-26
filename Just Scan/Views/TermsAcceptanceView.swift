@@ -21,13 +21,22 @@ struct TermsAcceptanceView: View {
             VStack(spacing: 30) {
                 Spacer()
                 
-                // App Icon/Logo
-                Image(systemName: "doc.text.viewfinder")
-                    .font(.system(size: 60))
-                    .foregroundColor(.blue)
+                // App Icon/Logo - Match loading screen size and style
+                VStack(spacing: 20) {
+                    Image("LaunchImage")
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        .frame(width: 200, height: 200)
+                    
+                    // Just Scan text - match loading screen
+                    Text("Just Scan")
+                        .font(.system(size: 32, weight: .black, design: .rounded))
+                        .foregroundColor(.white)
+                }
                 
                 Text("Welcome to Just Scan")
                     .font(.system(size: 28, weight: .bold))
+                    .foregroundColor(.white)
                 
                 Text("The Sovereign Utility Scanner")
                     .font(.subheadline)
@@ -88,8 +97,8 @@ struct TermsAcceptanceView: View {
                             .fontWeight(.semibold)
                             .frame(maxWidth: .infinity)
                             .padding()
-                            .background(hasAcceptedTerms ? Color.blue : Color.gray)
-                            .foregroundColor(.white)
+                            .background(hasAcceptedTerms ? Color.white : Color.gray)
+                            .foregroundColor(hasAcceptedTerms ? .black : .white)
                             .cornerRadius(12)
                     }
                     .disabled(!hasAcceptedTerms)

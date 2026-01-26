@@ -15,11 +15,62 @@ class DocumentService: ObservableObject {
     @Published var documents: [Document] = []
     
     private let documentsDirectory: URL
+    private let metadataURL: URL
+    private var documentIDMap: [String: UUID] = [:] // Maps fileURL.path -> documentID
     
     private init() {
         let fileManager = FileManager.default
         documentsDirectory = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        metadataURL = documentsDirectory.appendingPathComponent("document_metadata.json")
+        loadDocumentMetadata()
         loadDocuments()
+    }
+    
+    // MARK: - Document ID Persistence
+    
+    /// Load document ID mapping from disk
+    private func loadDocumentMetadata() {
+        guard let data = try? Data(contentsOf: metadataURL),
+              let map = try? JSONDecoder().decode([String: String].self, from: data) else {
+            documentIDMap = [:]
+            return
+        }
+        
+        // Convert string UUIDs to UUID objects
+        documentIDMap = map.compactMapValues { UUID(uuidString: $0) }
+        print("✅ Loaded \(documentIDMap.count) document IDs from metadata")
+    }
+    
+    /// Save document ID mapping to disk
+    private func saveDocumentMetadata() {
+        // Convert UUIDs to strings for JSON encoding
+        let stringMap = documentIDMap.mapValues { $0.uuidString }
+        
+        guard let data = try? JSONEncoder().encode(stringMap) else {
+            print("❌ Failed to encode document metadata")
+            return
+        }
+        
+        do {
+            try data.write(to: metadataURL, options: .atomic)
+            print("✅ Saved document metadata")
+        } catch {
+            print("❌ Failed to save document metadata: \(error)")
+        }
+    }
+    
+    /// Get or create a stable document ID for a file URL
+    private func getDocumentID(for url: URL) -> UUID {
+        let path = url.path
+        if let existingID = documentIDMap[path] {
+            return existingID
+        }
+        
+        // Create new ID and save it
+        let newID = UUID()
+        documentIDMap[path] = newID
+        saveDocumentMetadata()
+        return newID
     }
     
     func loadDocuments() {
@@ -35,13 +86,33 @@ class DocumentService: ObservableObject {
                       let creationDate = attributes[.creationDate] as? Date else {
                     return nil
                 }
-                return Document(
+                
+                // CRITICAL: Use stable document ID (persisted across app launches)
+                let documentID = getDocumentID(for: url)
+                
+                var document = Document(
+                    id: documentID,
                     fileName: url.lastPathComponent,
                     createdAt: creationDate,
                     fileURL: url
                 )
+                
+                // Include signature edits in "last modified" ordering
+                let signatureURL = document.signatureStorageURL
+                if let sigAttrs = try? fileManager.attributesOfItem(atPath: signatureURL.path),
+                   let sigModified = sigAttrs[.modificationDate] as? Date {
+                    if document.lastModified == nil || sigModified > (document.lastModified ?? sigModified) {
+                        document.lastModified = sigModified
+                    }
+                }
+                
+                return document
             }
-            .sorted { $0.createdAt > $1.createdAt } // Newest first
+            .sorted {
+                let lhs = $0.lastModified ?? $0.createdAt
+                let rhs = $1.lastModified ?? $1.createdAt
+                return lhs > rhs
+            }
     }
     
     func savePDF(_ pdfDocument: PDFDocument, filterType: FilterType = .blackAndWhite) throws -> Document {
@@ -56,7 +127,11 @@ class DocumentService: ObservableObject {
             throw DocumentError.saveFailed
         }
         
+        // CRITICAL: Register the new document's ID in metadata
         let document = Document(fileName: fileName, fileURL: fileURL)
+        documentIDMap[fileURL.path] = document.id
+        saveDocumentMetadata()
+        
         documents.insert(document, at: 0) // Insert at beginning (newest first)
         return document
     }
@@ -64,6 +139,11 @@ class DocumentService: ObservableObject {
     func deleteDocument(_ document: Document) throws {
         let fileManager = FileManager.default
         try fileManager.removeItem(at: document.fileURL)
+        
+        // Remove from ID map
+        documentIDMap.removeValue(forKey: document.fileURL.path)
+        saveDocumentMetadata()
+        
         documents.removeAll { $0.id == document.id }
     }
     
@@ -78,6 +158,12 @@ class DocumentService: ObservableObject {
         
         try fileManager.moveItem(at: document.fileURL, to: newURL)
         
+        // Update ID map (remove old path, add new path with same ID)
+        if let oldID = documentIDMap.removeValue(forKey: document.fileURL.path) {
+            documentIDMap[newURL.path] = oldID
+            saveDocumentMetadata()
+        }
+        
         if let index = documents.firstIndex(where: { $0.id == document.id }) {
             documents[index] = Document(
                 id: document.id,
@@ -90,13 +176,21 @@ class DocumentService: ObservableObject {
     
     func applyFilter(to pdfDocument: PDFDocument, filterType: FilterType) -> PDFDocument {
         guard filterType != .color else {
+            print("✅ Filter type is color - returning original document")
             return pdfDocument // No processing needed for color
         }
         
+        print("🔄 Applying \(filterType.rawValue) filter to \(pdfDocument.pageCount) pages")
         let filteredPDF = PDFDocument()
+        var successCount = 0
+        var failCount = 0
         
         for pageIndex in 0..<pdfDocument.pageCount {
-            guard let page = pdfDocument.page(at: pageIndex) else { continue }
+            guard let page = pdfDocument.page(at: pageIndex) else {
+                print("⚠️ Failed to get page \(pageIndex)")
+                failCount += 1
+                continue
+            }
             
             let pageRect = page.bounds(for: .mediaBox)
             // Use opaque rendering to avoid alpha channel issues
@@ -111,9 +205,14 @@ class DocumentService: ObservableObject {
             let filteredImage = applyFilter(to: image, filterType: filterType)
             
             // Convert to non-alpha image to avoid PDF warnings
-            if let cgImage = filteredImage.cgImage {
+            guard let cgImage = filteredImage.cgImage else {
+                print("⚠️ Failed to get CGImage for page \(pageIndex)")
+                failCount += 1
+                continue
+            }
+            
                 let colorSpace = CGColorSpaceCreateDeviceRGB()
-                let context = CGContext(
+            guard let context = CGContext(
                     data: nil,
                     width: cgImage.width,
                     height: cgImage.height,
@@ -121,18 +220,36 @@ class DocumentService: ObservableObject {
                     bytesPerRow: 0,
                     space: colorSpace,
                     bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
-                )
-                
-                if let context = context {
-                    context.draw(cgImage, in: CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height))
-                    if let finalImage = context.makeImage() {
-                        let uiImage = UIImage(cgImage: finalImage)
-                        if let filteredPage = PDFPage(image: uiImage) {
-                            filteredPDF.insert(filteredPage, at: filteredPDF.pageCount)
-                        }
-                    }
-                }
+            ) else {
+                print("⚠️ Failed to create CGContext for page \(pageIndex)")
+                failCount += 1
+                continue
             }
+            
+                    context.draw(cgImage, in: CGRect(x: 0, y: 0, width: cgImage.width, height: cgImage.height))
+            guard let finalImage = context.makeImage() else {
+                print("⚠️ Failed to create final CGImage for page \(pageIndex)")
+                failCount += 1
+                continue
+            }
+            
+                        let uiImage = UIImage(cgImage: finalImage)
+            guard let filteredPage = PDFPage(image: uiImage) else {
+                print("⚠️ Failed to create PDFPage from image for page \(pageIndex)")
+                failCount += 1
+                continue
+            }
+            
+            filteredPDF.insert(filteredPage, at: filteredPDF.pageCount)
+            successCount += 1
+        }
+        
+        print("✅ Filter complete: \(successCount) pages succeeded, \(failCount) pages failed")
+        
+        // ✅ If no pages succeeded, return original document to prevent empty PDF
+        if filteredPDF.pageCount == 0 {
+            print("❌ All pages failed - returning original document")
+            return pdfDocument
         }
         
         return filteredPDF

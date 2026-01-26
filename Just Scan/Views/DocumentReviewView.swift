@@ -23,22 +23,14 @@ struct DocumentReviewView: View {
     @State private var showSignaturePreview = false
     @State private var showOCROverlay = false
     @State private var ocrText = ""
-    @State private var showFilterOptions = false
-    @State private var selectedFilter: FilterType = .blackAndWhite
     @State private var showColorPicker = false
+    @State private var editingSignatureID: UUID? = nil // ✅ ID of signature being edited
     
     // Unified signature state
     @State private var signatures: [Int: [SignatureModel]] = [:]
     @State private var activeSignatureID: UUID? = nil {
         didSet {
-            // #region agent log
-            DebugLogger.shared.logStateChange(
-                "activeSignatureID (DocumentReviewView)",
-                oldValue: oldValue?.uuidString,
-                newValue: activeSignatureID?.uuidString,
-                hypothesisId: "A"
-            )
-            // #endregion
+            
             // ✅ Force view refresh when selection changes
             selectionBoxRefreshID = UUID()
         }
@@ -57,6 +49,15 @@ struct DocumentReviewView: View {
     @State private var showExitPrompt: Bool = false
     @State private var showDocumentSignatureWarning: Bool = false
     @State private var pendingShareAction: (() -> Void)? = nil
+    @State private var showPaywall = false
+    @State private var pendingExportType: ExportType? = nil
+    @State private var isExporting = false  // ✅ Export lock to prevent double-taps
+    @StateObject private var storeManager = StoreManager.shared
+    
+    enum ExportType {
+        case secure
+        case flattened
+    }
     
     private let signatureAnnotationName = "JustScanSignature_v1"
     
@@ -114,13 +115,27 @@ struct DocumentReviewView: View {
                 .navigationBarTitleDisplayMode(.inline)
         .toolbar { toolbarContent }
                 .interactiveDismissDisabled(true)
+        }
                 .sheet(isPresented: $showSignatureCanvas) {
-                    SignatureCanvasView(onSave: {
-                        if signatureService.hasSignature {
-                            let imageID = signatureService.currentSignatureID?.uuidString
-                            editorProxy.addNewSignature(imageID: imageID)
-                        }
-                    })
+            SignatureCanvasView(
+                onSave: {
+                    // ✅ If editing, update the signature's imageID in the document
+                    if let editingID = editingSignatureID,
+                       let activeID = activeSignatureID,
+                       let activeSignature = signatures[currentPageIndex]?.first(where: { $0.id == activeID }),
+                       activeSignature.imageID == editingID.uuidString,
+                       let newImageID = signatureService.currentSignatureID?.uuidString {
+                        // Update the signature model's imageID to point to the new signature image
+                        editorProxy.updateSignatureImageID(signatureID: activeID, newImageID: newImageID)
+                    } else if signatureService.hasSignature {
+                        // New signature created - add it to document
+                        let imageID = signatureService.currentSignatureID?.uuidString
+                        editorProxy.addNewSignature(imageID: imageID)
+                    }
+                    editingSignatureID = nil // Clear editing state
+                },
+                existingSignatureID: editingSignatureID
+            )
                 }
                 .sheet(isPresented: $showSignaturePreview) {
                     SignaturePreviewView(onEdit: {
@@ -128,42 +143,36 @@ struct DocumentReviewView: View {
                         showSignatureCanvas = true
                     })
                 }
+        .sheet(isPresented: $showOCROverlay) {
+            OCRResultView(text: ocrText)
+                }
                 .confirmationDialog("Signature", isPresented: $showSignatureOptions) {
-                    if signatureService.hasSignature {
-                        Button("Insert Signature") {
-                            let imageID = signatureService.currentSignatureID?.uuidString
-                            editorProxy.addNewSignature(imageID: imageID)
-                        }
-                        Button("Preview Signature") { showSignaturePreview = true }
-                        Button("Edit Signature") { showSignatureCanvas = true }
-                        Button("Delete Signature", role: .destructive) { signatureService.clearSignature() }
-                    } else {
-                        Button("Create Signature") { showSignatureCanvas = true }
-                    }
+            signatureOptionsDialog
+        }
+        .confirmationDialog("Change Color", isPresented: $showColorPicker) {
+            colorPickerDialog
+        }
+        .alert("Multiple Signatures Detected", isPresented: $showSignatureWarning) {
                     Button("Cancel", role: .cancel) {}
-                }
-                .confirmationDialog("Filter", isPresented: $showFilterOptions) {
-                    ForEach(FilterType.allCases, id: \.self) { filter in
-                        Button(filter.rawValue) { applyFilter(filter) }
-                    }
-                    Button("Cancel", role: .cancel) {}
-                }
-                .confirmationDialog("Change Color", isPresented: $showColorPicker) {
-                    ForEach(SignatureColor.allCases, id: \.self) { color in
-                        Button(color.rawValue.capitalized) {
-                            editorProxy.changeActiveSignatureColor(color)
-                        }
-                    }
-                    Button("Cancel", role: .cancel) {}
-                }
-                .sheet(isPresented: $showOCROverlay) {
-                    OCRResultView(text: ocrText)
+            Button("Save Anyway") {
+                _ = editorProxy.saveToDisk(url: document.fileURL)
+                dismiss()
+            }
+        } message: {
+            Text("This document contains different signature images. Are you sure you want to proceed?")
+        }
+        .confirmationDialog("Unsaved Changes", isPresented: $showExitPrompt) {
+            unsavedChangesDialog
+        } message: {
+            Text("You have unsaved signature changes. Save or discard before exiting.")
+        }
+        .confirmationDialog("Different signatures detected", isPresented: $showDocumentSignatureWarning) {
+            documentSignatureWarningDialog
+        } message: {
+            Text("This document contains different signature images across pages. Do you want to continue sharing?")
                 }
                 .onAppear {
                     loadPDF()
-                    // #region agent log
-                    DebugLogger.shared.log(location: "DocumentReviewView.swift:\(#line)", message: "DocumentReviewView appeared", data: ["document": document.fileName], hypothesisId: "A")
-                    // #endregion
                 }
                 .onChange(of: ocrCoordinator.resultText) { newValue in
                     if let text = newValue {
@@ -179,44 +188,94 @@ struct DocumentReviewView: View {
                         ocrCoordinator.errorMessage = nil
                     }
                 }
-                .alert("Multiple Signatures Detected", isPresented: $showSignatureWarning) {
-                    Button("Cancel", role: .cancel) {}
-                    Button("Save Anyway") {
-                        editorProxy.commitAllToPDF()
-                    }
-                } message: {
-                    Text("This document contains different signature images. Are you sure you want to proceed?")
+                .sheet(isPresented: $showPaywall) {
+                    PaywallView(context: .export)
+                        .onDisappear {
+                            // When paywall dismisses, check if purchase was successful and retry export
+                            if storeManager.hasPurchased {
+                                retryPendingExport()
+                            }
+                        }
                 }
-                .confirmationDialog("Unsaved Changes", isPresented: $showExitPrompt) {
-                    Button("Save") {
-                        editorProxy.commitAllToPDF()
-                        _ = editorProxy.saveToDisk(url: document.fileURL)
-                        editorProxy.selectSignature(nil)
-                        hasPendingChanges = false
-                        dismiss()
+                .onChange(of: storeManager.hasPurchased) { hasPurchased in
+                    // If purchase happens while paywall is open, auto-dismiss and retry
+                    if hasPurchased && showPaywall {
+                        showPaywall = false
+                        // Small delay to ensure paywall dismisses first
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                            retryPendingExport()
+                        }
                     }
-                    Button("Discard", role: .destructive) {
-                        loadPDF()
-                        dismiss()
-                    }
-                    Button("Cancel", role: .cancel) {}
-                } message: {
-                    Text("You have unsaved signature changes. Save or discard before exiting.")
                 }
-                .confirmationDialog("Different signatures detected", isPresented: $showDocumentSignatureWarning) {
-                    Button("Share Anyway") {
-                        let action = pendingShareAction
-                        pendingShareAction = nil
-                        showDocumentSignatureWarning = false
-                        action?()
-                    }
-                    Button("Cancel", role: .cancel) {
-                        pendingShareAction = nil
-                        showDocumentSignatureWarning = false
-                    }
-                } message: {
-                    Text("This document contains different signature images across pages. Do you want to continue sharing?")
+    }
+    
+    // MARK: - Dialog Content
+    
+    @ViewBuilder
+    private var signatureOptionsDialog: some View {
+        if signatureService.hasSignature {
+            Button("Insert Signature") {
+                let imageID = signatureService.currentSignatureID?.uuidString
+                editorProxy.addNewSignature(imageID: imageID)
+            }
+            Button("Preview Signature") { showSignaturePreview = true }
+            Button("Edit Signature") {
+                // ✅ Edit the currently selected signature in the document
+                if let activeID = activeSignatureID,
+                   let activeSignature = signatures[currentPageIndex]?.first(where: { $0.id == activeID }),
+                   let imageUUID = UUID(uuidString: activeSignature.imageID),
+                   let signature = signatureService.signatureHistory.first(where: { $0.id == imageUUID }) {
+                    // Open canvas with existing signature to edit
+                    editingSignatureID = signature.id
+                    showSignatureCanvas = true
+                } else {
+                    // No signature selected or signature not found - just open canvas
+                    editingSignatureID = nil
+                    showSignatureCanvas = true
                 }
+            }
+        } else {
+            Button("Create Signature") { showSignatureCanvas = true }
+        }
+        Button("Cancel", role: .cancel) {}
+    }
+    
+    @ViewBuilder
+    private var colorPickerDialog: some View {
+        ForEach(SignatureColor.allCases, id: \.self) { color in
+            Button(color.rawValue.capitalized) {
+                editorProxy.changeActiveSignatureColor(color)
+            }
+        }
+        Button("Cancel", role: .cancel) {}
+    }
+    
+    @ViewBuilder
+    private var unsavedChangesDialog: some View {
+        Button("Save") {
+            _ = editorProxy.saveToDisk(url: document.fileURL)
+            editorProxy.selectSignature(nil)
+            hasPendingChanges = false
+            dismiss()
+        }
+        Button("Discard", role: .destructive) {
+            loadPDF()
+            dismiss()
+        }
+        Button("Cancel", role: .cancel) {}
+    }
+    
+    @ViewBuilder
+    private var documentSignatureWarningDialog: some View {
+        Button("Share Anyway") {
+            let action = pendingShareAction
+            pendingShareAction = nil
+            showDocumentSignatureWarning = false
+            action?()
+        }
+        Button("Cancel", role: .cancel) {
+            pendingShareAction = nil
+            showDocumentSignatureWarning = false
         }
     }
     
@@ -253,7 +312,7 @@ struct DocumentReviewView: View {
                 GeometryReader { geometry in
                         ZStack {
                         PDFEditorRepresentable(
-                            pdfDocument: pdfDocument,
+                                        pdfDocument: pdfDocument,
                             document: document,  // For JSON-based signature persistence
                             signatures: $signatures,
                             currentPageIndex: $currentPageIndex,
@@ -272,22 +331,6 @@ struct DocumentReviewView: View {
                         .shadow(color: .black.opacity(0.15), radius: 10, y: 5)
                         .overlay(
                             Group {
-                                // #region agent log
-                                let _ = {
-                                    DebugLogger.shared.log(
-                                        location: "DocumentReviewView.swift:\(#line)",
-                                        message: "Checking selection box conditions",
-                                        data: [
-                                            "activeSignatureID": activeSignatureID?.uuidString ?? "nil",
-                                            "currentPageIndex": currentPageIndex,
-                                            "hasSignatures": signatures[currentPageIndex] != nil,
-                                            "signatureCount": signatures[currentPageIndex]?.count ?? 0
-                                        ],
-                                        hypothesisId: "B"
-                                    )
-                                }()
-                                // #endregion
-                                
                                 if let activeID = activeSignatureID,
                                    let activeSignature = signatures[currentPageIndex]?.first(where: { $0.id == activeID }),
                                    let screenRect = editorProxy.getActiveSignatureScreenRect(),
@@ -296,87 +339,71 @@ struct DocumentReviewView: View {
                                     
                                     let rectCenter = CGPoint(x: screenRect.midX, y: screenRect.midY)
                                     let toolbarOffset: CGFloat = 80
-                                    let rotationHandleOffset: CGFloat = 50
                                     
-                                    FloatingToolbarView(
-                                        position: CGPoint(x: rectCenter.x, y: screenRect.minY - toolbarOffset),
-                                        onMove: { delta in
-                                            editorProxy.moveActiveSignature(by: delta)
-                                        },
-                                        onMoveEnd: {
-                                            editorProxy.endMoveSignature()
-                                        },
-                                        onColor: { showColorPicker = true },
-                                        onDelete: { editorProxy.deleteActiveSignature() },
-                                        onDuplicate: { editorProxy.duplicateActiveSignature() },
-                                        onCopy: {},
-                                        onPaste: {},
-                                        canPaste: false
-                                    )
-                                    .zIndex(2000)
-                                    .id("toolbar-\(activeID.uuidString)")
+                                    // Calculate toolbar position (above selection box)
+                                    let toolbarY = screenRect.minY - toolbarOffset
+                                    let toolbarPosition = CGPoint(x: rectCenter.x, y: toolbarY)
                                     
-                                    SelectionBoxView(
-                                        position: rectCenter,
-                                        size: screenRect.size,
-                                        rotation: activeSignature.rotation,
-                                        rotationHandleOffset: rotationHandleOffset,
-                                        onMove: { delta in
-                                            editorProxy.moveActiveSignature(by: delta)
-                                        },
-                                        onResize: { scaleFactor in
-                                            editorProxy.resizeActiveSignature(by: scaleFactor)
-                                        },
-                                        onRotate: { angle in
-                                            editorProxy.rotateActiveSignature(by: angle)
-                                        },
-                                        onMoveEnd: {
-                                            editorProxy.endMoveSignature()
-                                        },
-                                        onResizeEnd: {
-                                            editorProxy.endResizeSignature()
-                                        },
-                                        onRotateEnd: {
-                                            editorProxy.endRotateSignature()
-                                        }
-                                    )
-                                    // ✅ CRITICAL: Selection box border is non-interactive (set inside SelectionBoxView)
-                                    // Corner handles and rotation handle are interactive (they have their own hit testing)
-                                    // This allows pan gestures to pass through the border to PDFView while keeping handles functional
-                                    // ✅ CRITICAL FIX: Disable implicit animation to prevent jittering during PDF redraws
-                                    .transaction { transaction in
-                                        transaction.animation = nil
-                                    }
-                                    .zIndex(1000)
-                                    .id("selection-\(activeID.uuidString)-\(currentPageIndex)-\(selectionBoxRefreshID)")
-                                    .onAppear {
-                                        // #region agent log - REMOVED: Too verbose (renders every frame)
-                                        // selectionBoxRenderCount += 1
-                                        // #endregion
-                                    }
-                                } else {
-                                    // #region agent log
-                                    let _ = {
-                                        var failureReasons: [String] = []
-                                        if activeSignatureID == nil {
-                                            failureReasons.append("activeSignatureID is nil")
-                                        } else if signatures[currentPageIndex]?.first(where: { $0.id == activeSignatureID! }) == nil {
-                                            failureReasons.append("signature not found in model")
-                                        } else if let rect = editorProxy.getActiveSignatureScreenRect() {
-                                            if rect.width <= 0 || rect.height <= 0 {
-                                                failureReasons.append("rect has invalid size: \(rect)")
-                                            }
-                                        } else {
-                                            failureReasons.append("getActiveSignatureScreenRect returned nil")
-                                        }
-                                        DebugLogger.shared.log(
-                                            location: "DocumentReviewView.swift:\(#line)",
-                                            message: "❌ Selection box conditions failed",
-                                            data: ["failureReasons": failureReasons],
-                                            hypothesisId: "B"
+                                    // ✅ Calculate rotation handle offset: positioned halfway between toolbar and selection box top
+                                    // Toolbar is at: rectCenter.y - (screenRect.height/2) - toolbarOffset
+                                    // Selection box top is at: rectCenter.y - (screenRect.height/2)
+                                    // Middle point: (toolbarY + selectionBoxTopY) / 2
+                                    let selectionBoxTopY = rectCenter.y - screenRect.height / 2
+                                    let middleY = (toolbarY + selectionBoxTopY) / 2
+                                    // Offset from selection box top to middle point
+                                    let rotationHandleOffset = middleY - selectionBoxTopY
+        
+        ZStack {
+                                        FloatingToolbarView(
+                                            position: toolbarPosition,
+                                            onMove: { delta in
+                                                editorProxy.moveActiveSignature(by: delta)
+                                            },
+                                            onMoveEnd: {
+                                                editorProxy.endMoveSignature()
+                                            },
+                                            onColor: { showColorPicker = true },
+                                            onDelete: { editorProxy.deleteActiveSignature() },
+                                            onDuplicate: { editorProxy.duplicateActiveSignature() },
+                                            onCopy: {},
+                                            onPaste: {},
+                                            canPaste: false
                                         )
-                                    }()
-                                    // #endregion
+                                        .zIndex(2000)
+                                        .id("toolbar-\(activeID.uuidString)")
+                                        
+                                        // ✅ Selection box with rotation handle INSIDE (rotates together like main branch)
+                                        SelectionBoxView(
+                                            position: rectCenter,
+                                            size: screenRect.size,
+                                            rotation: activeSignature.rotation,
+                                            rotationHandleOffset: rotationHandleOffset, // ✅ Position handle between toolbar and box
+                                            onMove: { delta in
+                                                editorProxy.moveActiveSignature(by: delta)
+                                            },
+                                            onResize: { scaleFactor in
+                                                editorProxy.resizeActiveSignature(by: scaleFactor)
+                                            },
+                                            onRotate: { angle in
+                                                editorProxy.rotateActiveSignature(by: angle)
+                                            },
+                                            onMoveEnd: {
+                                                editorProxy.endMoveSignature()
+                                            },
+                                            onResizeEnd: {
+                                                editorProxy.endResizeSignature()
+                                            },
+                                            onRotateEnd: {
+                                                editorProxy.endRotateSignature()
+                                            }
+                                        )
+                                        // ✅ CRITICAL: Disable implicit animation to prevent jittering during PDF redraws
+                                        .transaction { transaction in
+                                            transaction.animation = nil
+                                        }
+                                        .zIndex(1500)
+                                        .id("selection-\(activeID.uuidString)-\(currentPageIndex)-\(selectionBoxRefreshID)")
+                                    }
                                 }
                             }
                         )
@@ -436,7 +463,6 @@ struct DocumentReviewView: View {
                             Image(systemName: "plus.circle")
                         }
                         Button("Save") {
-                    editorProxy.commitAllToPDF()
                     _ = editorProxy.saveToDisk(url: document.fileURL)
                     editorProxy.selectSignature(nil)
                     hasPendingChanges = false
@@ -450,7 +476,6 @@ struct DocumentReviewView: View {
                 } else {
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button("Done") {
-                    editorProxy.commitAllToPDF()
                     _ = editorProxy.saveToDisk(url: document.fileURL)
                         dismiss()
                     }
@@ -475,14 +500,12 @@ struct DocumentReviewView: View {
                         Button { secureAndShare() } label: {
                             Label("Share Secured PDF", systemImage: "square.and.arrow.up")
                         }
-                        Button { secureAndShareFlattened() } label: {
+                        // Only show Flattened PDF if document has signatures
+                        if hasSignaturesInDocument {
+                            Button { secureAndShareFlattened() } label: {
                                 Label("Share Flattened PDF", systemImage: "square.and.arrow.up.on.square.fill")
                             }
                         }
-                        Section("Document Tools") {
-                            Button("Filters", systemImage: "slider.horizontal.3") {
-                                showFilterOptions = true
-                            }
                         }
                     } label: {
                         Image(systemName: "ellipsis.circle")
@@ -490,6 +513,56 @@ struct DocumentReviewView: View {
             }
         }
     }
+    
+// MARK: - Rotation Handle View (Fixed Position)
+
+struct RotationHandleView: View {
+    let position: CGPoint
+    let rotation: CGFloat
+    // ✅ Need the center point of the signature to calculate rotation angle
+    let signatureCenter: CGPoint
+    let onRotate: (CGFloat) -> Void
+    let onRotateEnd: () -> Void
+    
+    @State private var lastRotationAngle: CGFloat = 0
+    
+    var body: some View {
+        Image(systemName: "arrow.triangle.2.circlepath")
+            .font(.system(size: 14, weight: .medium))
+            .foregroundColor(.white)
+            .frame(width: 28, height: 28)
+            .background(Color.gray.opacity(0.8))
+            .clipShape(Circle())
+            .position(position)
+            // ✅ Don't rotate icon here - parent group handles rotation
+            // Only apply rotation if not part of a rotated group (for backward compatibility)
+            .rotationEffect(.degrees(rotation))
+            .gesture(
+                DragGesture()
+                    .onChanged { value in
+                        // Calculate angle from signature center to current drag position
+                        // Note: value.location is in screen coordinates, signatureCenter is also in screen coordinates
+                        let currentAngle = atan2(value.location.y - signatureCenter.y, value.location.x - signatureCenter.x) * 180 / .pi
+                        let startAngle = atan2(value.startLocation.y - signatureCenter.y, value.startLocation.x - signatureCenter.x) * 180 / .pi
+                        
+                        if lastRotationAngle == 0 {
+                            lastRotationAngle = startAngle
+                            return // Don't rotate on first touch, just set initial angle
+                        }
+                        
+                        let delta = currentAngle - lastRotationAngle
+                        // Normalize delta to -180 to 180 range
+                        let normalizedDelta = ((delta + 180).truncatingRemainder(dividingBy: 360)) - 180
+                        onRotate(normalizedDelta)
+                        lastRotationAngle = currentAngle
+                    }
+                    .onEnded { _ in
+                        lastRotationAngle = 0
+                        onRotateEnd()
+                    }
+            )
+    }
+}
     
     // MARK: - Pagination Bar
     
@@ -563,13 +636,14 @@ struct DocumentReviewView: View {
         ocrCoordinator.performOCR(cgImage: cgImage)
     }
     
-    private func applyFilter(_ filterType: FilterType) {
-            selectedFilter = filterType
-        editorProxy.setVisualFilter(filterType)
-    }
-    
     private func secureAndShare() {
-        editorProxy.commitAllToPDF()
+        // Check if user has purchased
+        guard storeManager.hasPurchased else {
+            pendingExportType = .secure
+            showPaywall = true
+            return
+        }
+        
         if hasMixedSignaturesInDocument() {
             pendingShareAction = { self.performSecureShare() }
             showDocumentSignatureWarning = true
@@ -579,12 +653,31 @@ struct DocumentReviewView: View {
     }
     
     private func secureAndShareFlattened() {
-        editorProxy.commitAllToPDF()
+        // Check if user has purchased
+        guard storeManager.hasPurchased else {
+            pendingExportType = .flattened
+            showPaywall = true
+            return
+        }
+        
         if hasMixedSignaturesInDocument() {
             pendingShareAction = { self.performFlattenedShare() }
             showDocumentSignatureWarning = true
         } else {
             performFlattenedShare()
+        }
+    }
+    
+    // Retry export after successful purchase
+    private func retryPendingExport() {
+        guard let exportType = pendingExportType else { return }
+        pendingExportType = nil
+        
+        switch exportType {
+        case .secure:
+            secureAndShare()
+        case .flattened:
+            secureAndShareFlattened()
         }
     }
     
@@ -594,18 +687,59 @@ struct DocumentReviewView: View {
             return
         }
         
-        // ARCHITECTURE: Use SignatureExportService to create annotations with payload
-        guard let exportData = SignatureExportService.shared.exportSecure(
-            pdfDocument: pdfDoc,
-            signatures: signatures
-        ),
-        let exportDoc = PDFDocument(data: exportData) else {
-            print("❌ Failed to create secure export")
-            return
-        }
+        // ✅ Prevent double-taps
+        guard !isExporting else { return }
         
-        print("✅ Created secure PDF with \(signatures.values.reduce(0) { $0 + $1.count }) signatures")
-        sharePDF(exportDoc, mode: "secured")
+        // ✅ Set export lock
+        isExporting = true
+        
+        Task {
+            // ✅ Lock lifecycle inside Task - defer runs when Task completes
+            defer {
+                Task { @MainActor in
+                    isExporting = false
+                }
+            }
+            
+            // ✅ Snapshot PDF to Data on main thread (one-time cost)
+            let baseData = await MainActor.run {
+                pdfDoc.dataRepresentation()
+            }
+            
+            guard let baseData = baseData else {
+                print("❌ Failed to snapshot PDF")
+                return
+            }
+            
+            // ✅ Fix #3: Sanitize filename
+            let safeName = document.fileName
+                .replacingOccurrences(of: "/", with: "_")
+                .replacingOccurrences(of: ":", with: "_")
+            
+            // ✅ Create temp file URL
+            let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("\(safeName)_secured.pdf")
+            try? FileManager.default.removeItem(at: tempURL)
+            
+            // ✅ Keep secure export on MainActor (safer with PDFKit)
+            let resultURL = await MainActor.run {
+                SignatureExportService.shared.exportSecure(
+                    inputPDFData: baseData,
+                    signatures: signatures,
+                    to: tempURL
+                )
+            }
+            
+            guard let resultURL = resultURL else {
+                print("❌ Failed to create secure export")
+                return
+            }
+            
+            // ✅ Back to main thread for UI
+            await MainActor.run {
+                print("✅ Created secure PDF with \(signatures.values.reduce(0) { $0 + $1.count }) signatures")
+                sharePDF(at: resultURL, mode: "secured")
+            }
+        }
     }
     
     private func performFlattenedShare() {
@@ -614,83 +748,139 @@ struct DocumentReviewView: View {
             return
         }
         
-        // ARCHITECTURE: Use SignatureExportService to render signatures into page pixels
-        guard let exportData = SignatureExportService.shared.exportFlattened(
-            pdfDocument: pdfDoc,
-            signatures: signatures
-        ),
-        let exportDoc = PDFDocument(data: exportData) else {
-            print("❌ Failed to create flattened export")
-            return
-        }
+        // ✅ Prevent double-taps
+        guard !isExporting else { return }
         
-        // Optionally apply filter
-        let finalDoc: PDFDocument
-        if selectedFilter == .color {
-            finalDoc = exportDoc
-        } else {
-            finalDoc = DocumentService.shared.applyFilter(to: exportDoc, filterType: selectedFilter)
-        }
+        // ✅ Set export lock
+        isExporting = true
         
-        print("✅ Created flattened PDF with \(signatures.values.reduce(0) { $0 + $1.count }) signatures")
-        sharePDF(finalDoc, mode: "flattened")
-    }
-    
-    private func sharePDF(_ pdfDocument: PDFDocument, mode: String) {
-        // #region agent log
-        DebugLogger.shared.logEntry("sharePDF", params: [
-            "mode": mode,
-            "pageCount": pdfDocument.pageCount,
-            "fileName": document.fileName
-        ], hypothesisId: "SHARE")
-        // #endregion
-        
-        let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("\(document.fileName)_shared.pdf")
-        guard pdfDocument.write(to: tempURL) else {
-            // #region agent log
-            DebugLogger.shared.logHypothesis("SHARE", message: "❌ Failed to write PDF to temp file", data: ["tempURL": tempURL.path])
-            // #endregion
-            return
-        }
-        
-                                        // #region agent log
-        DebugLogger.shared.log(
-            location: "DocumentReviewView.swift:sharePDF",
-            message: "PDF written to temp file",
-                                            data: [
-                "tempURL": tempURL.path,
-                "fileExists": FileManager.default.fileExists(atPath: tempURL.path)
-            ],
-            hypothesisId: "SHARE"
-                                        )
-                                        // #endregion
-        
-        let activityVC = UIActivityViewController(activityItems: [tempURL], applicationActivities: nil)
-        if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
-           let rootViewController = windowScene.windows.first?.rootViewController {
-            // #region agent log
-            DebugLogger.shared.logHypothesis("SHARE", message: "✅ Presenting share sheet", data: ["mode": mode])
-            // #endregion
-            rootViewController.present(activityVC, animated: true)
-        } else {
-            // #region agent log
-            DebugLogger.shared.logHypothesis("SHARE", message: "❌ Failed to get root view controller", data: [:])
-            // #endregion
-        }
-    }
-    
-    private func hasMixedSignaturesInDocument() -> Bool {
-        guard let pdfDoc = pdfDocument else { return false }
-        var signatureHashes: Set<Int> = []
-        for pageIndex in 0..<pdfDoc.pageCount {
-            if let page = pdfDoc.page(at: pageIndex) {
-                for annotation in page.annotations where isSignatureAnnotation(annotation) {
-                    if let stamp = annotation as? ImageStampAnnotation, let image = stamp.imageSnapshot {
-                        signatureHashes.insert(image.pngData()?.hashValue ?? 0)
-                    }
+        Task {
+            // ✅ Lock lifecycle inside Task - defer runs when Task completes
+            defer {
+                Task { @MainActor in
+                    isExporting = false
                 }
             }
+            
+            // ✅ Snapshot PDF to Data on main thread (one-time cost)
+            let baseData = await MainActor.run {
+                pdfDoc.dataRepresentation()
+            }
+            
+            guard let baseData = baseData else {
+                print("❌ Failed to snapshot PDF")
+                return
+            }
+            
+            // ✅ Fix #3: Sanitize filename
+            let safeName = document.fileName
+                .replacingOccurrences(of: "/", with: "_")
+                .replacingOccurrences(of: ":", with: "_")
+            
+            // ✅ Create temp file URL
+            let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("\(safeName)_flattened.pdf")
+            try? FileManager.default.removeItem(at: tempURL)
+            
+            // ✅ Pre-fetch signature images on MainActor before background work
+            let signatureImages = await MainActor.run {
+                var images: [String: UIImage] = [:]
+                for (_, pageSignatures) in signatures {
+                    for signature in pageSignatures {
+                        if let uuid = UUID(uuidString: signature.imageID),
+                           let savedSignature = signatureService.signatureHistory.first(where: { $0.id == uuid }) {
+                            images[signature.imageID] = savedSignature.image
+                        } else if let currentImage = signatureService.signatureImage {
+                            images[signature.imageID] = currentImage
+                        }
+                    }
+                }
+                return images
+            }
+            
+            // ✅ Heavy work off main thread using snapshot Data
+            // Explicitly capture values to avoid Sendable issues
+            let capturedBaseData = baseData
+            let capturedSignatures = signatures
+            let capturedSignatureImages = signatureImages
+            let capturedTempURL = tempURL
+            
+            let resultURL = await Task.detached(priority: .userInitiated) { @Sendable () -> URL? in
+                // Call the static method from nonisolated struct - no await needed
+                return PDFExportHelper.exportFlattened(
+                    inputPDFData: capturedBaseData,
+                    signatures: capturedSignatures,
+                    signatureImages: capturedSignatureImages,
+                    to: capturedTempURL
+                )
+            }.value
+            
+            // ✅ Guard against nil (no force unwrap)
+            guard let resultURL = resultURL else {
+                print("❌ Failed to create flattened export")
+                return
+            }
+            
+            // ✅ Back to main thread for UI
+            await MainActor.run {
+                print("✅ Created flattened PDF with \(signatures.values.reduce(0) { $0 + $1.count }) signatures")
+                sharePDF(at: resultURL, mode: "flattened")
+            }
         }
-        return signatureHashes.count > 1
+    }
+    
+    // ✅ Update sharePDF to accept URL instead of PDFDocument
+    private func sharePDF(at url: URL, mode: String) {
+        // Verify file was created
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            print("❌ Temporary PDF file does not exist")
+            return
+        }
+        
+        print("✅ PDF ready at: \(url.path)")
+        
+        // Present iOS share sheet
+        let activityVC = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        
+        // For iPad, set popover presentation
+        if let popover = activityVC.popoverPresentationController {
+            popover.permittedArrowDirections = .any
+        }
+        
+        // Find the topmost view controller to present from
+        if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
+           let window = windowScene.windows.first,
+           let rootViewController = window.rootViewController {
+            var topController = rootViewController
+            while let presented = topController.presentedViewController {
+                topController = presented
+            }
+            topController.present(activityVC, animated: true)
+            print("✅ Share sheet presented")
+        } else {
+            print("❌ Could not find view controller to present share sheet")
+        }
+    }
+    
+    /// Check if document has any signatures at all
+    private var hasSignaturesInDocument: Bool {
+        let totalSignatures = signatures.values.reduce(0) { $0 + $1.count }
+        return totalSignatures > 0
+    }
+    
+    /// Check if document contains multiple different signature images.
+    /// Uses imageID (stable UUID) instead of hashValue (unreliable).
+    /// ARCHITECTURE: Checks SignatureModel array (JSON store), not PDF annotations.
+    private func hasMixedSignaturesInDocument() -> Bool {
+        // Collect all unique imageIDs from all pages
+        var uniqueImageIDs: Set<String> = []
+        
+        for (_, pageSignatures) in signatures {
+            for signature in pageSignatures {
+                uniqueImageIDs.insert(signature.imageID)
+            }
+        }
+        
+        // If more than one unique imageID, user has mixed signatures
+        return uniqueImageIDs.count > 1
     }
 }

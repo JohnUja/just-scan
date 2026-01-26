@@ -245,8 +245,8 @@ class PDFCoordinateConverter {
         
         // If rect is bigger than the page, then yes — it must shrink.
         // But for normal signatures, it shouldn't ever be bigger, so this is rare.
-        var w = min(pdfRect.width, bounds.width)
-        var h = min(pdfRect.height, bounds.height)
+        let w = min(pdfRect.width, bounds.width)
+        let h = min(pdfRect.height, bounds.height)
         
         var x = pdfRect.origin.x
         var y = pdfRect.origin.y

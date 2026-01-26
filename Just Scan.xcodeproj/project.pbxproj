@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		017DAB1A2F15BD9500525705 /* StoreKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 017DAB192F15BD9400525705 /* StoreKit.framework */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		0199B31E2EF1A76000C8E122 /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -24,6 +28,7 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		017DAB192F15BD9400525705 /* StoreKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = StoreKit.framework; path = System/Library/Frameworks/StoreKit.framework; sourceTree = SDKROOT; };
 		0199B30D2EF1A75A00C8E122 /* Just Scan.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "Just Scan.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 		0199B31D2EF1A76000C8E122 /* Just ScanTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "Just ScanTests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
 		0199B3272EF1A76000C8E122 /* Just ScanUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = "Just ScanUITests.xctest"; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -52,6 +57,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				017DAB1A2F15BD9500525705 /* StoreKit.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -72,12 +78,21 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		017DAB182F15BD9400525705 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				017DAB192F15BD9400525705 /* StoreKit.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
 		0199B3042EF1A75A00C8E122 = {
 			isa = PBXGroup;
 			children = (
 				0199B30F2EF1A75A00C8E122 /* Just Scan */,
 				0199B3202EF1A76000C8E122 /* Just ScanTests */,
 				0199B32A2EF1A76000C8E122 /* Just ScanUITests */,
+				017DAB182F15BD9400525705 /* Frameworks */,
 				0199B30E2EF1A75A00C8E122 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -399,18 +414,20 @@
 				DEVELOPMENT_TEAM = BWC2VJDMH9;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "Just-Scan-Info.plist";
 				INFOPLIST_KEY_NSCameraUsageDescription = "Just Scan uses your camera to scan documents. All processing happens on your device. No data is sent to external servers.";
+				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "Just Scan needs access to save your app icon to Photos for App Store submission.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
-				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UILaunchStoryboardName = LaunchScreen;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "JIT.Just-Scan";
+				MARKETING_VERSION = 1.1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.jit.justscan;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 6.0;
@@ -429,18 +446,20 @@
 				DEVELOPMENT_TEAM = BWC2VJDMH9;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "Just-Scan-Info.plist";
 				INFOPLIST_KEY_NSCameraUsageDescription = "Just Scan uses your camera to scan documents. All processing happens on your device. No data is sent to external servers.";
+				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "Just Scan needs access to save your app icon to Photos for App Store submission.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
-				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				INFOPLIST_KEY_UILaunchStoryboardName = LaunchScreen;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = "JIT.Just-Scan";
+				MARKETING_VERSION = 1.1;
+				PRODUCT_BUNDLE_IDENTIFIER = com.jit.justscan;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 6.0;

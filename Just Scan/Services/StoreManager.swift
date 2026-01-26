@@ -14,18 +14,23 @@ class StoreManager: ObservableObject {
     
     @Published var products: [Product] = []
     @Published var purchasedProductIDs: Set<String> = []
+    @Published private(set) var productsLoaded = false
     
-    private let productID = "com.justscan.onetime" // You'll need to create this in App Store Connect
+    private let productID = "com.justscan.unlock" // You'll need to create this in App Store Connect
     
-    // DEVELOPER BYPASS: Remove this before App Store release
+    #if DEBUG
+    // DEVELOPER BYPASS (Debug only)
     private var developerBypass: Bool {
         get {
             UserDefaults.standard.bool(forKey: "developerBypassPurchased")
         }
         set {
             UserDefaults.standard.set(newValue, forKey: "developerBypassPurchased")
+            // Trigger view update when bypass changes
+            objectWillChange.send()
         }
     }
+    #endif
     
     private init() {
         Task {
@@ -34,30 +39,63 @@ class StoreManager: ObservableObject {
     }
     
     var hasPurchased: Bool {
-        developerBypass || purchasedProductIDs.contains(productID)
+        #if DEBUG
+        return developerBypass || purchasedProductIDs.contains(productID)
+        #else
+        return purchasedProductIDs.contains(productID)
+        #endif
     }
     
-    // DEVELOPER BYPASS: Remove this function before App Store release
+    // Expose bypass state for testing UI
+    var isBypassEnabled: Bool {
+        #if DEBUG
+        return developerBypass
+        #else
+        return false
+        #endif
+    }
+    
+    #if DEBUG
     func setDeveloperBypass(_ enabled: Bool) {
         developerBypass = enabled
         // Trigger view update
         objectWillChange.send()
     }
+    #else
+    func setDeveloperBypass(_ enabled: Bool) {
+        // No-op in Release builds
+    }
+    #endif
     
     func loadProducts() {
         Task {
             do {
+                print("🛒 Loading products with ID: \(productID)")
                 let products = try await Product.products(for: [productID])
+                print("🛒 Loaded \(products.count) products")
+                if products.isEmpty {
+                    print("⚠️ WARNING: No products found! Make sure '\(productID)' exists in App Store Connect")
+                } else {
+                    print("✅ Product found: \(products.first?.displayName ?? "Unknown") - \(products.first?.displayPrice ?? "No price")")
+                }
                 self.products = products
+                self.productsLoaded = !products.isEmpty
             } catch {
-                print("Failed to load products: \(error)")
+                self.productsLoaded = false
+                print("❌ Failed to load products: \(error)")
+                print("❌ Error details: \(error.localizedDescription)")
+                if let storeKitError = error as? StoreKitError {
+                    print("❌ StoreKit error: \(storeKitError)")
+                }
             }
         }
     }
     
     func purchaseProduct(completion: @escaping (Bool, Error?) -> Void) {
         guard let product = products.first else {
-            completion(false, NSError(domain: "StoreManager", code: -1, userInfo: [NSLocalizedDescriptionKey: "Product not available"]))
+            Task { @MainActor in
+                completion(false, NSError(domain: "StoreManager", code: -1, userInfo: [NSLocalizedDescriptionKey: "Product not available"]))
+            }
             return
         }
         
@@ -71,19 +109,31 @@ class StoreManager: ObservableObject {
                     case .verified(let transaction):
                         await transaction.finish()
                         await loadPurchasedProducts()
-                        completion(true, nil)
+                        await MainActor.run {
+                            completion(true, nil)
+                        }
                     case .unverified(_, let error):
-                        completion(false, error)
+                        await MainActor.run {
+                            completion(false, error)
+                        }
                     }
                 case .userCancelled:
-                    completion(false, NSError(domain: "StoreManager", code: -2, userInfo: [NSLocalizedDescriptionKey: "Purchase cancelled"]))
+                    await MainActor.run {
+                        completion(false, NSError(domain: "StoreManager", code: -2, userInfo: [NSLocalizedDescriptionKey: "Purchase cancelled"]))
+                    }
                 case .pending:
-                    completion(false, NSError(domain: "StoreManager", code: -3, userInfo: [NSLocalizedDescriptionKey: "Purchase pending"]))
+                    await MainActor.run {
+                        completion(false, NSError(domain: "StoreManager", code: -3, userInfo: [NSLocalizedDescriptionKey: "Purchase pending"]))
+                    }
                 @unknown default:
-                    completion(false, NSError(domain: "StoreManager", code: -4, userInfo: [NSLocalizedDescriptionKey: "Unknown purchase result"]))
+                    await MainActor.run {
+                        completion(false, NSError(domain: "StoreManager", code: -4, userInfo: [NSLocalizedDescriptionKey: "Unknown purchase result"]))
+                    }
                 }
             } catch {
-                completion(false, error)
+                await MainActor.run {
+                    completion(false, error)
+                }
             }
         }
     }
@@ -93,10 +143,14 @@ class StoreManager: ObservableObject {
             do {
                 try await AppStore.sync()
                 await loadPurchasedProducts()
-                completion(hasPurchased)
+                await MainActor.run {
+                    completion(hasPurchased)
+                }
             } catch {
                 print("Failed to restore purchases: \(error)")
-                completion(false)
+                await MainActor.run {
+                    completion(false)
+                }
             }
         }
     }

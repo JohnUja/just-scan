@@ -11,10 +11,12 @@ import SwiftUI
 struct Just_ScanApp: App {
     @StateObject private var storeManager = StoreManager.shared
     @State private var hasAcceptedTerms = UserDefaults.standard.bool(forKey: "hasAcceptedTerms")
+    @State private var hasEnteredApp = false  // ✅ Track if user entered app from landing
     
     var body: some Scene {
         WindowGroup {
-            if storeManager.hasPurchased {
+            if storeManager.hasPurchased || hasEnteredApp {
+                // ✅ Show app if purchased OR user clicked Continue on landing
             ContentView()
                     .preferredColorScheme(.dark) // Force dark mode
             } else if !hasAcceptedTerms {
@@ -23,7 +25,10 @@ struct Just_ScanApp: App {
                 }
                 .preferredColorScheme(.dark)
             } else {
-                PaywallView()
+                PaywallView(context: .landing, onContinue: {
+                    // ✅ Landing Continue: Always allow entry (no purchase required)
+                    hasEnteredApp = true
+                })
                     .preferredColorScheme(.dark)
             }
         }

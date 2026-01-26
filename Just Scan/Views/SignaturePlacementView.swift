@@ -467,24 +467,13 @@ struct SelectionBoxView: View {
         ZStack {
             // ✅ Selection box border - visual only, doesn't intercept touches
             Rectangle()
-                .stroke(Color.yellow, lineWidth: 3)  // ✅ Thicker line for visibility
+                .stroke(Color.yellow, lineWidth: 1)  // ✅ Yellow line with regular stroke
                 .frame(width: max(minSize, abs(size.width)), height: max(minSize, abs(size.height)))
                 .rotationEffect(.degrees(rotation))
                 .position(position)
                 .allowsHitTesting(false)  // ✅ Border doesn't intercept touches - allows pan gesture to pass through
                 .onAppear {
-                    // #region agent log
-                    DebugLogger.shared.log(
-                        location: "SelectionBoxView.swift:onAppear",
-                        message: "✅ SelectionBoxView.onAppear",
-                        data: [
-                            "position": "\(position)",
-                            "size": "\(size)",
-                            "rotation": rotation
-                        ],
-                        hypothesisId: "B"
-                    )
-                    // #endregion
+                    
                 }
             
             // Warning icon when near borders
@@ -539,17 +528,18 @@ struct SelectionBoxView: View {
                     )
             }
             
-            // ✅ Rotation handle - gray background, positioned above top edge (only one, no duplicates)
-            // ✅ MUST have hit testing enabled
-            Image(systemName: "arrow.triangle.2.circlepath")
-                .font(.system(size: 14, weight: .medium))
-                .foregroundColor(.white)
-                .frame(width: 28, height: 28)
-                .background(Color.gray.opacity(0.8))  // ✅ Gray instead of blue
-                .clipShape(Circle())
+            // ✅ Rotation handle - only show if rotationHandleOffset is provided (for SignaturePlacementView)
+            // In DocumentReviewView, rotation handle is separate (RotationHandleView)
+            if rotationHandleOffset != nil {
+                Image(systemName: "arrow.triangle.2.circlepath")
+                    .font(.system(size: 14, weight: .medium))
+                    .foregroundColor(.white)
+                    .frame(width: 28, height: 28)
+                    .background(Color.gray.opacity(0.8))
+                    .clipShape(Circle())
                 .position(rotationHandlePosition)
-                .zIndex(3000)  // ✅ Above everything
-                .allowsHitTesting(true)  // ✅ CRITICAL: Rotation handle must be interactive
+                    .zIndex(3000)
+                    .allowsHitTesting(true)
                 .gesture(
                     DragGesture()
                         .onChanged { value in
@@ -562,17 +552,17 @@ struct SelectionBoxView: View {
                             }
                             
                             let delta = currentAngle - lastRotationAngle
-                            // Normalize angle difference
                             let normalizedDelta = ((delta + 180).truncatingRemainder(dividingBy: 360)) - 180
                             onRotate(normalizedDelta)
                             lastRotationAngle = currentAngle
                         }
                         .onEnded { _ in
                             lastRotationAngle = 0
-                            onRotateEnd()
+                                onRotateEnd()
                         }
                 )
         }
+    }
         .onAppear {
             // Check if near borders and show warning
             checkBorders()
@@ -635,35 +625,21 @@ private struct MoveIconView: View {
     let onMove: (CGSize) -> Void
     let onMoveEnd: (() -> Void)?
     
-    @State private var lastLocation: CGPoint = .zero
-    
     var body: some View {
         Image(systemName: "arrow.up.and.down.and.arrow.left.and.right")
-            .font(.system(size: 14))
+            .font(.system(size: 12))  // ✅ Reduced by ~20%
             .foregroundColor(.white)
-            .frame(width: 32, height: 32)
+            .frame(width: 26, height: 26)  // ✅ Reduced by ~20% (32 * 0.8)
             .background(Color(white: 0.3, opacity: 0.9))
             .clipShape(Circle())
             .gesture(
-                // ✅ SIMPLIFIED: Direct delta calculation (same as pan gesture) - no smoothing/throttling
+                // ✅ SMOOTH: Use translation directly (native SwiftUI, no jitter)
                 DragGesture(minimumDistance: 0)
                     .onChanged { value in
-                        if lastLocation == .zero {
-                            lastLocation = value.startLocation
-                        }
-                        
-                        // Calculate delta from last location (same as pan gesture)
-                        let delta = CGSize(
-                            width: value.location.x - lastLocation.x,
-                            height: value.location.y - lastLocation.y
-                        )
-                        
-                        // Apply immediately (no smoothing - same as pan gesture)
-                        onMove(delta)
-                        lastLocation = value.location
+                        // Use translation directly - SwiftUI handles smoothing
+                        onMove(value.translation)
                     }
                     .onEnded { _ in
-                        lastLocation = .zero
                         onMoveEnd?()
                     }
         )
@@ -719,9 +695,9 @@ struct FloatingToolbarView: View {
                 onColor()
             } label: {
                 Image(systemName: "paintpalette.fill")
-                    .font(.system(size: 14))  // ✅ Slightly smaller
+                    .font(.system(size: 12))  // ✅ Reduced by ~20%
                     .foregroundColor(.white)
-                    .frame(width: 32, height: 32)  // ✅ More compact
+                    .frame(width: 26, height: 26)  // ✅ Reduced by ~20% (32 * 0.8)
                     .background(Color(white: 0.3, opacity: 0.9))
                     .clipShape(Circle())
             }
@@ -731,9 +707,9 @@ struct FloatingToolbarView: View {
                 onDuplicate()
             } label: {
                 Image(systemName: "square.on.square")
-                    .font(.system(size: 14))  // ✅ Slightly smaller
+                    .font(.system(size: 12))  // ✅ Reduced by ~20%
                     .foregroundColor(.white)
-                    .frame(width: 32, height: 32)  // ✅ More compact
+                    .frame(width: 26, height: 26)  // ✅ Reduced by ~20% (32 * 0.8)
                     .background(Color(white: 0.3, opacity: 0.9))
                     .clipShape(Circle())
             }
@@ -744,9 +720,9 @@ struct FloatingToolbarView: View {
                     onPaste()
                 } label: {
                     Image(systemName: "doc.on.clipboard")
-                        .font(.system(size: 16))
+                        .font(.system(size: 13))  // ✅ Reduced by ~20%
                         .foregroundColor(.white)
-                        .frame(width: 36, height: 36)
+                        .frame(width: 29, height: 29)  // ✅ Reduced by ~20% (36 * 0.8)
                         .background(Color(white: 0.3, opacity: 0.9))
                         .clipShape(Circle())
                 }
@@ -757,15 +733,15 @@ struct FloatingToolbarView: View {
                 onDelete()
             } label: {
                 Image(systemName: "trash.fill")
-                    .font(.system(size: 16))
+                    .font(.system(size: 13))  // ✅ Reduced by ~20%
                     .foregroundColor(.red)
-                    .frame(width: 36, height: 36)
+                    .frame(width: 29, height: 29)  // ✅ Reduced by ~20% (36 * 0.8)
                     .background(Color(white: 0.3, opacity: 0.9))
                     .clipShape(Circle())
             }
         }
         .padding(.horizontal, 8)   // ✅ Reduced horizontal padding
-        .padding(.vertical, 6)     // ✅ Reduced vertical padding for sleeker look
+        .padding(.vertical, 4)     // ✅ Reduced by ~20% (6 * 0.8 = 4.8, rounded to 4)
         .background(
             .ultraThinMaterial,
             in: Capsule()

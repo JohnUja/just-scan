@@ -26,24 +26,33 @@ struct HomeView: View {
     @State private var showPageReorder = false
     @State private var pagesToReorder: [UIImage] = []
     
+    private let gridSpacing: CGFloat = 12
+    private let gridPadding: CGFloat = 16
     let columns = [
         GridItem(.flexible(), spacing: 12),
         GridItem(.flexible(), spacing: 12)
     ]
     
     var body: some View {
+        let totalWidth = max(0, UIScreen.main.bounds.width - (gridPadding * 2))
+        let rawTileSize = (totalWidth - gridSpacing) / 2
+        let safeTileSize = clampTileSize(rawTileSize)
+        
         NavigationStack {
             ScrollView {
-                LazyVGrid(columns: columns, spacing: 12) {
+                LazyVGrid(columns: columns, spacing: gridSpacing) {
                     // Live camera tile (top-left)
                     LiveCameraTile {
                         checkCameraPermissionAndScan()
                     }
+                    .frame(width: safeTileSize, height: safeTileSize)
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
                     
                     // Document thumbnails
                     ForEach(documentService.documents) { document in
                         DocumentGridView(
                             document: document,
+                            tileSize: safeTileSize,
                             onTap: {
                                 selectedDocument = document
                             },
@@ -64,11 +73,15 @@ struct HomeView: View {
                         )
                     }
                 }
-                .padding()
+                .padding(gridPadding)
             }
             .navigationTitle("My Scans")
             .navigationBarTitleDisplayMode(.large)
             .toolbar {
+                ToolbarItem(placement: .principal) {
+                    Text("My Scans")
+                        .font(.system(size: 28, weight: .bold)) // ~90% of default large title size
+                }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button {
                         showSettings = true
@@ -318,12 +331,10 @@ struct HomeView: View {
         
         // Process all images and add to PDF
         for image in images {
-            // Stage 1: downscale and lightly compress to save storage, then apply B&W
+            // Stage 1: downscale and lightly compress to save storage (preserve original color)
             let compressed = compressImage(image, maxDimension: 2500, quality: 0.8)
-            let filteredImage = applyBlackAndWhiteFilter(to: compressed)
             
-            // Ensure image is properly sized for PDF
-            guard let pdfPage = PDFPage(image: filteredImage) else {
+            guard let pdfPage = PDFPage(image: compressed) else {
                 print("Failed to create PDF page from image")
                 continue
             }
@@ -345,25 +356,6 @@ struct HomeView: View {
         } catch {
             print("Failed to save document: \(error.localizedDescription)")
         }
-    }
-    
-    private func applyBlackAndWhiteFilter(to image: UIImage) -> UIImage {
-        guard let cgImage = image.cgImage else { return image }
-        
-        let context = CIContext(options: nil)
-        let ciImage = CIImage(cgImage: cgImage)
-        
-        guard let filter = CIFilter(name: "CIColorControls") else { return image }
-        filter.setValue(ciImage, forKey: kCIInputImageKey)
-        filter.setValue(1.5, forKey: kCIInputContrastKey) // High contrast
-        filter.setValue(0.0, forKey: kCIInputSaturationKey) // Remove color
-        
-        guard let outputImage = filter.outputImage,
-              let cgImage = context.createCGImage(outputImage, from: outputImage.extent) else {
-            return image
-        }
-        
-        return UIImage(cgImage: cgImage)
     }
     
     private func compressImage(_ image: UIImage, maxDimension: CGFloat, quality: CGFloat) -> UIImage {
@@ -388,6 +380,13 @@ struct HomeView: View {
             return img
         }
         return scaled
+    }
+
+    private func clampTileSize(_ value: CGFloat) -> CGFloat {
+        if value.isFinite, value > 1 {
+            return value
+        }
+        return 150
     }
 }
 

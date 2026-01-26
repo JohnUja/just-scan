@@ -37,11 +37,13 @@ class PDFEditorControllerProxy: ObservableObject {
         controller?.changeActiveSignatureColor(color)
     }
     
+    func updateSignatureImageID(signatureID: UUID, newImageID: String) {
+        controller?.updateSignatureImageID(signatureID: signatureID, newImageID: newImageID)
+    }
+    
     // MARK: - Document Management
     
-    func commitAllToPDF() {
-        controller?.commitAllToPDF()
-    }
+    // DEPRECATED: commitAllToPDF() removed - use SignatureExportService for export
     
     func saveToDisk(url: URL) -> Bool {
         return controller?.saveToDisk(url: url) ?? false
@@ -100,19 +102,11 @@ class PDFEditorControllerProxy: ObservableObject {
     
     func getActiveSignatureScreenRect() -> CGRect? {
         guard let controller = controller else {
-            // #region agent log - REMOVED: Too verbose
-            // #endregion
             return nil
         }
-        // #region agent log - REMOVED: Called too frequently (every frame)
-        // #endregion
         guard let rect = controller.getActiveSignatureScreenRect() else {
-            // #region agent log - REMOVED: Too verbose
-            // #endregion
             return nil
         }
-        // #region agent log - REMOVED: Called too frequently (every frame)
-        // #endregion
         return rect
     }
     

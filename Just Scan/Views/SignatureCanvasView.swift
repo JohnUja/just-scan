@@ -10,6 +10,7 @@ struct SignatureCanvasView: View {
     @StateObject private var signatureService = SignatureService.shared
     
     let onSave: (() -> Void)?
+    let existingSignatureID: UUID? // ✅ Optional: ID of signature to edit
     
     @State private var currentDrawing = Drawing()
     @State private var drawings: [Drawing] = []
@@ -23,14 +24,30 @@ struct SignatureCanvasView: View {
     @State private var showStrokeOptions = false
     @State private var showMaxSignaturesAlert = false
     
-    init(onSave: (() -> Void)? = nil) {
+    // ✅ Reference image (existing signature to edit)
+    @State private var referenceImage: UIImage?
+    
+    init(onSave: (() -> Void)? = nil, existingSignatureID: UUID? = nil) {
         self.onSave = onSave
+        self.existingSignatureID = existingSignatureID
     }
     
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
                 // Canvas
+                ZStack {
+                    Color.black
+                    
+                    // ✅ Show existing signature as reference (semi-transparent)
+                    if let referenceImage = referenceImage {
+                        Image(uiImage: referenceImage)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .opacity(0.3) // Semi-transparent so user can draw over it
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+                    
                 Canvas { context, size in
                     for drawing in drawings {
                         drawStroke(context: context, points: drawing.points, width: drawing.lineWidth)
@@ -38,7 +55,7 @@ struct SignatureCanvasView: View {
                     drawStroke(context: context, points: currentDrawing.points, width: strokeWidth)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(Color.black)
+                }
                 .gesture(
                     DragGesture(minimumDistance: 0)
                         .onChanged { value in
@@ -134,11 +151,18 @@ struct SignatureCanvasView: View {
                 .padding()
                 .background(Color(uiColor: .systemBackground))
             }
-            .navigationTitle("Sign Here")
+            .navigationTitle(existingSignatureID != nil ? "Edit Signature" : "Sign Here")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button("Cancel") { dismiss() }
+                }
+            }
+            .onAppear {
+                // ✅ Load existing signature image if editing
+                if let signatureID = existingSignatureID,
+                   let signature = signatureService.signatureHistory.first(where: { $0.id == signatureID }) {
+                    referenceImage = signature.image
                 }
             }
             .alert("Maximum Signatures Reached", isPresented: $showMaxSignaturesAlert) {
@@ -224,14 +248,29 @@ struct SignatureCanvasView: View {
             }
         }
         
-        if signatureService.saveSignature(image) {
+        // ✅ If editing existing signature, replace it; otherwise create new
+        if let existingID = existingSignatureID {
+            // Replace existing signature
+            signatureService.deleteSignature(existingID)
+            if signatureService.saveSignature(image) {
+                dismiss()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    onSave?()
+                }
+            } else {
+                showMaxSignaturesAlert = true
+            }
+        } else {
+            // Create new signature
+            if signatureService.saveSignature(image) {
         dismiss()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
             onSave?()
+                }
+            } else {
+                // Show alert for maximum signature limit
+                showMaxSignaturesAlert = true
             }
-        } else {
-            // Show alert for maximum signature limit
-            showMaxSignaturesAlert = true
         }
     }
 }

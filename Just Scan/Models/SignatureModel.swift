@@ -251,25 +251,7 @@ struct SignatureModel: Identifiable, Equatable, Codable {
             widthRatio = pageBounds.width > 0 ? bounds.width / pageBounds.width : 0.2
         }
         
-        // #region agent log
-        // Log coordinate calculation for debugging bouncing (after widthRatio is calculated)
-        if let stamp = annotation as? ImageStampAnnotation {
-            DebugLogger.shared.log(
-                location: "SignatureModel.swift:fromAnnotation",
-                message: "Calculated center from annotation bounds",
-                data: [
-                    "bounds": "\(bounds)",
-                    "boundsMidX": bounds.midX,
-                    "boundsMidY": bounds.midY,
-                    "pageBounds": "\(pageBounds)",
-                    "normalizedCenter": "\(normalizedCenter)",
-                    "storedWidthRatio": stamp.originalWidthRatio,
-                    "calculatedWidthRatio": widthRatio
-                ],
-                hypothesisId: "C"
-            )
-        }
-        // #endregion
+        
         
         // Image ID: payload -> annotation property -> generate from imageData
         let imageID: String
@@ -349,12 +331,14 @@ enum SignatureColor: String, CaseIterable, Codable {
     case black
     case blue
     case red
+    case green
     
     var uiColor: UIColor {
         switch self {
         case .black: return .black
         case .blue: return .systemBlue
         case .red: return .systemRed
+        case .green: return .systemGreen
         }
     }
 }

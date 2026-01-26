@@ -19,7 +19,7 @@ struct TermsOfServiceView: View {
                         .fontWeight(.bold)
                         .padding(.bottom)
                     
-                    Text("Last Updated: December 16, 2025")
+                    Text("Last Updated: January 6, 2026")
                         .font(.caption)
                         .foregroundColor(.secondary)
                     
@@ -33,7 +33,7 @@ struct TermsOfServiceView: View {
                         """)
                         
                         SectionView(title: "3. One-Time Purchase", content: """
-                        Just Scan is available as a one-time purchase. Upon purchase, you own the App and all its features permanently. No subscriptions or recurring charges will apply.
+                        Just Scan is available as a one-time purchase of $9.99. Upon purchase, you own the App and all its features permanently. No subscriptions or recurring charges will apply. This special offer is valid until July 2026.
                         """)
                         
                         SectionView(title: "4. Privacy", content: """
@@ -57,7 +57,7 @@ struct TermsOfServiceView: View {
                         """)
                         
                         SectionView(title: "9. Contact", content: """
-                        For questions about these Terms, please contact us through the App Store listing or your preferred method of communication.
+                        For questions about these Terms, please contact us at support@juvantage.com.
                         """)
                     }
                 }

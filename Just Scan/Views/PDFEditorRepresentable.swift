@@ -51,6 +51,17 @@ struct PDFEditorRepresentable: UIViewControllerRepresentable {
     }
     
     func updateUIViewController(_ uiViewController: PDFSignatureEditorController, context: Context) {
+        // ✅ Check if PDFDocument instance changed (not just document ID) - forces reload when filter is applied
+        if uiViewController.pdfDocument !== pdfDocument {
+            uiViewController.loadDocument(pdfDocument, document: document)
+            return  // Early return to avoid other updates during reload
+        }
+        
+        // Update document reference if needed (for save to work)
+        if uiViewController.currentDocument?.id != document?.id {
+            uiViewController.loadDocument(pdfDocument, document: document)
+        }
+        
         // Page sync only - avoid unnecessary document reloads
         // CRITICAL: Don't sync activeSignatureID here - it causes selection to be cleared
         // The Combine subject already handles activeSignatureID updates
@@ -136,9 +147,7 @@ struct PDFEditorRepresentable: UIViewControllerRepresentable {
             controller.activeSignatureIDSubject
                 .receive(on: DispatchQueue.main)
                 .sink { [weak self] newID in
-                    // #region agent log
-                    DebugLogger.shared.logStateChange("activeSignatureID (Combine)", oldValue: nil, newValue: newID?.uuidString, hypothesisId: "A")
-                    // #endregion
+                    
                     self?.activeSignatureID = newID
                     // Force SwiftUI update by triggering a small delay
                     DispatchQueue.main.async {
@@ -163,14 +172,7 @@ struct PDFEditorRepresentable: UIViewControllerRepresentable {
         func syncInitialState(from controller: PDFSignatureEditorController) {
             // Prevent multiple syncs - only sync once on initial setup
             guard !hasSyncedInitialState else {
-                // #region agent log
-                DebugLogger.shared.log(
-                    location: "PDFEditorRepresentable.swift:syncInitialState",
-                    message: "Skipping sync - already synced",
-                    data: [:],
-                    hypothesisId: "B"
-                )
-                // #endregion
+                
                 return
             }
             hasSyncedInitialState = true
@@ -185,22 +187,9 @@ struct PDFEditorRepresentable: UIViewControllerRepresentable {
             }
             currentPageIndex = state.currentPageIndex
             hasPendingChanges = state.hasPendingChanges
-            // #region agent log
-            DebugLogger.shared.log(
-                location: "PDFEditorRepresentable.swift:syncInitialState",
-                message: "Synced initial state",
-                data: [
-                    "signatureCount": state.signatures.values.reduce(0) { $0 + $1.count },
-                    "activeSignatureID": state.activeSignatureID?.uuidString ?? "nil",
-                    "currentPageIndex": state.currentPageIndex,
-                    "preservedActiveID": activeSignatureID?.uuidString ?? "nil"
-                ],
-                hypothesisId: "B"
-            )
-            // #endregion
+            
         }
         
     }
 }
-
 

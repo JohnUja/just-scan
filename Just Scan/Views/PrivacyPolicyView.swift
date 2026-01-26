@@ -65,7 +65,7 @@ struct PrivacyPolicyView: View {
                         """)
                         
                         SectionView(title: "11. Contact", content: """
-                        For questions about this Privacy Policy, please contact us through the App Store listing.
+                        For questions about this Privacy Policy, please contact us at support@juvantage.com.
                         """)
                     }
                 }

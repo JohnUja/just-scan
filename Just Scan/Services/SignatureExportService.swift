@@ -17,6 +17,137 @@ import Foundation
 import UIKit
 import PDFKit
 
+// MARK: - Standalone Export Functions (Nonisolated for Background Threading)
+
+/// Helper struct for nonisolated export functions
+struct PDFExportHelper {
+    /// Export PDF with signatures flattened (burned into page pixels) directly to file
+    /// Result: Signatures cannot be moved in any PDF viewer. This is the "final" export.
+    /// - Parameters:
+    ///   - inputPDFData: The original PDF as Data (snapshot taken on main thread)
+    ///   - signatures: Signatures indexed by page number
+    ///   - signatureImages: Dictionary mapping signature imageID to UIImage (pre-fetched on MainActor)
+    ///   - outputURL: File URL to write the exported PDF to
+    /// - Returns: URL if successful, nil on failure
+    /// - Note: Static method in nonisolated struct so it can be called from background threads without MainActor access
+    static func exportFlattened(inputPDFData: Data, signatures: [Int: [SignatureModel]], signatureImages: [String: UIImage], to outputURL: URL) -> URL? {
+        // ✅ Use CGPDFDocument (thread-safe) instead of PDFDocument
+        // Create CGDataProvider from Data
+        guard let dataProvider = CGDataProvider(data: inputPDFData as CFData),
+              let cgPDFDoc = CGPDFDocument(dataProvider) else { return nil }
+        guard cgPDFDoc.numberOfPages > 0 else { return nil }
+        
+        // ✅ Create file-based consumer (writes directly to disk, not memory)
+        guard let consumer = CGDataConsumer(url: outputURL as CFURL),
+              let firstPage = cgPDFDoc.page(at: 1) else { return nil }
+        
+        var mediaBox = firstPage.getBoxRect(CGPDFBox.mediaBox)
+        guard let context = CGContext(consumer: consumer, mediaBox: &mediaBox, nil) else { return nil }
+        
+        // ✅ Wrap page rendering in autoreleasepool to release memory after each page
+        for pageIndex in 1...cgPDFDoc.numberOfPages {
+            autoreleasepool {
+                guard let page = cgPDFDoc.page(at: pageIndex) else { return }
+                let pageRect = page.getBoxRect(CGPDFBox.mediaBox)
+                
+                let pageInfo: [CFString: Any] = [kCGPDFContextMediaBox: pageRect]
+                context.beginPDFPage(pageInfo as CFDictionary)
+                
+                // Draw original page content
+                context.saveGState()
+                context.drawPDFPage(page)
+                context.restoreGState()
+                
+                // Draw signatures for this page (pageIndex - 1 because CGPDFDocument is 1-indexed)
+                let signaturePageIndex = pageIndex - 1
+                if let pageSignatures = signatures[signaturePageIndex] {
+                    for signature in pageSignatures {
+                        Self.drawSignatureOnContext(signature, to: context, pageRect: pageRect, signatureImages: signatureImages)
+                    }
+                }
+                
+                context.endPDFPage()
+                
+                // ✅ OOM insurance: flush every few pages (optional but recommended)
+                if pageIndex % 5 == 0 {
+                    context.flush()
+                }
+            }
+        }
+        
+        context.closePDF()
+        
+        return outputURL
+    }
+    
+    /// Draw a signature onto a CGContext (for flattened export) - updated to work with CGPDFDocument
+    /// ✅ Uses same coordinate math as SignatureModel.pdfRect(for:) - no Y flip needed
+    private static func drawSignatureOnContext(_ signature: SignatureModel, to context: CGContext, pageRect: CGRect, signatureImages: [String: UIImage]) {
+    guard let image = signatureImages[signature.imageID] else { return }
+    
+    // Apply color tint
+    let tintedImage = Self.applyColorTintToImage(image, color: signature.color.uiColor)
+    guard let cgImage = tintedImage.cgImage else { return }
+    
+    // ✅ Calculate PDF rect from normalized coordinates (EXACT same math as SignatureModel.pdfRect)
+    let pdfCenterX = signature.center.x * pageRect.width
+    let pdfCenterY = signature.center.y * pageRect.height  // ✅ No Y flip - center is already in PDF coords
+    let width = signature.widthRatio * pageRect.width
+    let height = width / signature.aspectRatio
+    
+    let pdfRect = CGRect(
+        x: pdfCenterX - width/2,
+        y: pdfCenterY - height/2,
+        width: width,
+        height: height
+    )
+    
+    context.saveGState()
+    
+    // Move to center of signature rect
+    context.translateBy(x: pdfRect.midX, y: pdfRect.midY)
+    
+    // Apply rotation (convert degrees to radians, negate for CoreGraphics CCW convention)
+    let radians = -signature.rotation * .pi / 180.0
+    context.rotate(by: radians)
+    
+    // Draw centered on origin
+    let drawRect = CGRect(
+        x: -pdfRect.width / 2,
+        y: -pdfRect.height / 2,
+        width: pdfRect.width,
+        height: pdfRect.height
+    )
+    context.draw(cgImage, in: drawRect)
+    
+    context.restoreGState()
+    }
+    
+    /// Apply color tint to a signature image
+    private static func applyColorTintToImage(_ image: UIImage, color: UIColor) -> UIImage {
+    // If black, return original (no tint needed)
+    if color == .black {
+        return image
+    }
+    
+    guard let cgImage = image.cgImage else { return image }
+    let size = image.size
+    let renderer = UIGraphicsImageRenderer(size: size)
+    
+    return renderer.image { context in
+        // Draw the color
+        context.cgContext.setFillColor(color.cgColor)
+        context.cgContext.fill(CGRect(origin: .zero, size: size))
+        
+        // Use destination-in blend mode to tint only the non-transparent parts
+        context.cgContext.setBlendMode(.destinationIn)
+        context.cgContext.draw(cgImage, in: CGRect(origin: .zero, size: size))
+    }
+    }
+}
+
+// MARK: - Service Class
+
 /// Service for exporting PDFs with signatures
 @MainActor
 class SignatureExportService {
@@ -27,117 +158,50 @@ class SignatureExportService {
     
     private init() {}
     
-    // MARK: - Export: Flattened (Final)
-    
-    /// Export PDF with signatures flattened (burned into page pixels)
-    /// Result: Signatures cannot be moved in any PDF viewer. This is the "final" export.
-    /// - Parameters:
-    ///   - pdfDocument: The original PDF document
-    ///   - signatures: Signatures indexed by page number
-    /// - Returns: PDF data with signatures rendered into pages, or nil on failure
-    func exportFlattened(pdfDocument: PDFDocument, signatures: [Int: [SignatureModel]]) -> Data? {
-        guard pdfDocument.pageCount > 0 else { return nil }
-        
-        let outputData = NSMutableData()
-        guard let consumer = CGDataConsumer(data: outputData as CFMutableData) else { return nil }
-        
-        // Get first page to initialize context
-        guard let firstPage = pdfDocument.page(at: 0) else { return nil }
-        var mediaBox = firstPage.bounds(for: .mediaBox)
-        
-        guard let context = CGContext(consumer: consumer, mediaBox: &mediaBox, nil) else { return nil }
-        
-        for pageIndex in 0..<pdfDocument.pageCount {
-            guard let page = pdfDocument.page(at: pageIndex) else { continue }
-            let pageRect = page.bounds(for: .mediaBox)
-            var pageBox = pageRect
-            
-            context.beginPDFPage([kCGPDFContextMediaBox as String: pageBox] as CFDictionary)
-            
-            // Draw original page content
-            context.saveGState()
-            page.draw(with: .mediaBox, to: context)
-            context.restoreGState()
-            
-            // Draw signatures for this page
-            if let pageSignatures = signatures[pageIndex] {
-                for signature in pageSignatures {
-                    drawSignature(signature, to: context, page: page)
-                }
-            }
-            
-            context.endPDFPage()
-        }
-        
-        context.closePDF()
-        
-        return outputData as Data
-    }
-    
     // MARK: - Export: Secure (Editable in Just Scan)
     
-    /// Export PDF with signatures as annotations containing payload
-    /// Result: Signatures can be moved in some PDF viewers.
-    ///         Re-importing in Just Scan will restore full editability.
+    /// Export PDF with signatures as annotations containing payload directly to file
     /// - Parameters:
-    ///   - pdfDocument: The original PDF document
+    ///   - inputPDFData: The original PDF as Data (snapshot taken on main thread)
     ///   - signatures: Signatures indexed by page number
-    /// - Returns: PDF data with signature annotations, or nil on failure
-    func exportSecure(pdfDocument: PDFDocument, signatures: [Int: [SignatureModel]]) -> Data? {
-        guard pdfDocument.pageCount > 0 else { return nil }
-        
-        // Create a copy of the document to avoid modifying the original
-        guard let pdfData = pdfDocument.dataRepresentation(),
-              let exportDoc = PDFDocument(data: pdfData) else { return nil }
-        
-        for pageIndex in 0..<exportDoc.pageCount {
-            guard let page = exportDoc.page(at: pageIndex) else { continue }
+    ///   - outputURL: File URL to write the exported PDF to
+    /// - Returns: URL if successful, nil on failure
+    func exportSecure(inputPDFData: Data, signatures: [Int: [SignatureModel]], to outputURL: URL) -> URL? {
+        // ✅ Use autoreleasepool for the entire document copy
+        return autoreleasepool {
+            // Create a copy of the document to avoid modifying the original
+            guard let exportDoc = PDFDocument(data: inputPDFData) else { return nil }
             
-            // Add signature annotations for this page
-            if let pageSignatures = signatures[pageIndex] {
-                for signature in pageSignatures {
-                    if let annotation = createAnnotation(from: signature, page: page) {
-                        page.addAnnotation(annotation)
+            for pageIndex in 0..<exportDoc.pageCount {
+                guard let page = exportDoc.page(at: pageIndex) else { continue }
+                
+                // Add signature annotations for this page
+                if let pageSignatures = signatures[pageIndex] {
+                    for signature in pageSignatures {
+                        if let annotation = createAnnotation(from: signature, page: page) {
+                            page.addAnnotation(annotation)
+                        }
                     }
                 }
             }
+            
+            // ✅ Write directly to file instead of returning Data
+            guard exportDoc.write(to: outputURL) else { return nil }
+            return outputURL
         }
-        
-        return exportDoc.dataRepresentation()
     }
     
     // MARK: - Private Helpers
     
-    /// Draw a signature onto a CGContext (for flattened export)
-    private func drawSignature(_ signature: SignatureModel, to context: CGContext, page: PDFPage) {
-        guard let image = getSignatureImage(for: signature) else { return }
-        
-        // Apply color tint
-        let tintedImage = applyColorTint(to: image, color: signature.color.uiColor)
-        guard let cgImage = tintedImage.cgImage else { return }
-        
-        // Get PDF rect from normalized coordinates
-        let pdfRect = signature.pdfRect(for: page)
-        
-        context.saveGState()
-        
-        // Move to center of signature rect
-        context.translateBy(x: pdfRect.midX, y: pdfRect.midY)
-        
-        // Apply rotation (convert degrees to radians, negate for CoreGraphics CCW convention)
-        let radians = -signature.rotation * .pi / 180.0
-        context.rotate(by: radians)
-        
-        // Draw centered on origin
-        let drawRect = CGRect(
-            x: -pdfRect.width / 2,
-            y: -pdfRect.height / 2,
-            width: pdfRect.width,
-            height: pdfRect.height
-        )
-        context.draw(cgImage, in: drawRect)
-        
-        context.restoreGState()
+    /// Get signature image from SignatureService
+    private func getSignatureImage(for signature: SignatureModel) -> UIImage? {
+        // Try to find in signature history first
+        if let uuid = UUID(uuidString: signature.imageID),
+           let savedSignature = signatureService.signatureHistory.first(where: { $0.id == uuid }) {
+            return savedSignature.image
+        }
+        // Fallback to current signature
+        return signatureService.signatureImage
     }
     
     /// Create an ImageStampAnnotation from a SignatureModel (for secure export)
@@ -174,7 +238,7 @@ class SignatureExportService {
         )
         
         // Set annotation properties
-        annotation.setValue(SignatureAnnotationKeys.annotationName, forAnnotationKey: .name)
+        annotation.setValue(SignatureAnnotationKeys.annotationName, forAnnotationKey: PDFAnnotationKey.name)
         annotation.userName = signature.id.uuidString
         annotation.shouldPrint = true
         annotation.isReadOnly = false
@@ -185,36 +249,5 @@ class SignatureExportService {
         return annotation
     }
     
-    /// Get the signature image from SignatureService
-    private func getSignatureImage(for signature: SignatureModel) -> UIImage? {
-        if let uuid = UUID(uuidString: signature.imageID),
-           let savedSignature = signatureService.signatureHistory.first(where: { $0.id == uuid }) {
-            return savedSignature.image
-        }
-        // Fallback to current signature
-        return signatureService.signatureImage
-    }
-    
-    /// Apply color tint to a signature image
-    private func applyColorTint(to image: UIImage, color: UIColor) -> UIImage {
-        // If black, return original (no tint needed)
-        if color == .black {
-            return image
-        }
-        
-        guard let cgImage = image.cgImage else { return image }
-        let size = image.size
-        let renderer = UIGraphicsImageRenderer(size: size)
-        
-        return renderer.image { context in
-            // Draw the color
-            context.cgContext.setFillColor(color.cgColor)
-            context.cgContext.fill(CGRect(origin: .zero, size: size))
-            
-            // Use destination-in blend mode to tint only the non-transparent parts
-            context.cgContext.setBlendMode(.destinationIn)
-            context.cgContext.draw(cgImage, in: CGRect(origin: .zero, size: size))
-        }
-    }
 }
 

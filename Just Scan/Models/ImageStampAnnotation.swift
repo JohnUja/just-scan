@@ -232,15 +232,12 @@ class ImageStampAnnotation: PDFAnnotation {
 
         context.saveGState()
         
-        // ✅ REMOVED: CTM logging from draw() - draw() runs off main actor, can't call main actor-isolated DebugLogger
-        // CTM tracking will be done from controller side before/after setNeedsDisplay()
-        
         // Move origin to annotation rect (LOCALIZE)
         context.translateBy(x: b.minX, y: b.minY)
 
         // Now we draw in local space (0..b.width, 0..b.height)
         context.translateBy(x: b.width * 0.5, y: b.height * 0.5)
-
+        
         // Your model stores clockwise degrees; CoreGraphics rotation is CCW, so negate
         let radians = -originalRotation * .pi / 180.0
         context.rotate(by: radians)
@@ -272,8 +269,8 @@ class ImageStampAnnotation: PDFAnnotation {
             context.cgContext.draw(cgImage, in: CGRect(origin: .zero, size: size))
         }
     }
-}
-
+        }
+        
 // MARK: - UIImage Orientation Normalization Extension
 extension UIImage {
     /// Normalize image orientation to .up to prevent flipping during color tinting
