@@ -22,6 +22,8 @@ struct SettingsView: View {
     private let privacyPolicyURL = URL(string: "https://juvantagecloud.com/just-scan/privacy-policy")!
     private let supportURL = URL(string: "https://juvantagecloud.com/support")!
     
+    private var isIPad: Bool { UIDevice.current.userInterfaceIdiom == .pad }
+    
     var body: some View {
         NavigationStack {
             List {
@@ -254,7 +256,7 @@ struct SettingsView: View {
                     HStack {
                         Text("Version")
                         Spacer()
-                        Text("1.0")
+                        Text("1.1")
                             .foregroundColor(.secondary)
                     }
                     
@@ -292,7 +294,16 @@ struct SettingsView: View {
                     SafariView(url: url)
                 }
             }
-            .sheet(isPresented: $showPaywall) {
+            .sheet(isPresented: Binding(
+                get: { showPaywall && !isIPad },
+                set: { if !$0 { showPaywall = false } }
+            )) {
+                PaywallView(context: .export)
+            }
+            .fullScreenCover(isPresented: Binding(
+                get: { showPaywall && isIPad },
+                set: { if !$0 { showPaywall = false } }
+            )) {
                 PaywallView(context: .export)
             }
         }

@@ -35,6 +35,31 @@ class StoreManager: ObservableObject {
     private init() {
         Task {
             await loadPurchasedProducts()
+            // Start listening for transaction updates (catches purchases from other devices, network issues, etc.)
+            await listenForTransactions()
+        }
+    }
+    
+    // Listen for transaction updates (StoreKit 2 best practice)
+    // Catches purchases that might happen outside the normal purchase flow
+    private func listenForTransactions() async {
+        for await result in Transaction.updates {
+            switch result {
+            case .verified(let transaction):
+                // Only handle our product
+                if transaction.productID == productID {
+                    await transaction.finish()
+                    // Reload purchased products to update UI
+                    await loadPurchasedProducts()
+                    print("✅ Transaction update received and processed: \(transaction.productID)")
+                } else {
+                    // Not our product, but still finish it
+                    await transaction.finish()
+                }
+            case .unverified(_, let error):
+                print("⚠️ Unverified transaction update: \(error.localizedDescription)")
+                // Don't finish unverified transactions
+            }
         }
     }
     
@@ -67,28 +92,19 @@ class StoreManager: ObservableObject {
     }
     #endif
     
-    func loadProducts() {
-        Task {
-            do {
-                print("🛒 Loading products with ID: \(productID)")
-                let products = try await Product.products(for: [productID])
-                print("🛒 Loaded \(products.count) products")
-                if products.isEmpty {
-                    print("⚠️ WARNING: No products found! Make sure '\(productID)' exists in App Store Connect")
-                } else {
-                    print("✅ Product found: \(products.first?.displayName ?? "Unknown") - \(products.first?.displayPrice ?? "No price")")
-                }
-                self.products = products
-                self.productsLoaded = !products.isEmpty
-            } catch {
-                self.productsLoaded = false
-                print("❌ Failed to load products: \(error)")
-                print("❌ Error details: \(error.localizedDescription)")
-                if let storeKitError = error as? StoreKitError {
-                    print("❌ StoreKit error: \(storeKitError)")
-                }
-            }
+    func loadProducts() async throws {
+        print("🛒 Loading products with ID: \(productID)")
+        let products = try await Product.products(for: [productID])
+        print("🛒 Loaded \(products.count) products")
+        
+        if products.isEmpty {
+            print("⚠️ WARNING: No products found! Make sure '\(productID)' exists in App Store Connect")
+        } else {
+            print("✅ Product found: \(products.first?.displayName ?? "Unknown") - \(products.first?.displayPrice ?? "No price")")
         }
+        
+        self.products = products
+        self.productsLoaded = !products.isEmpty
     }
     
     func purchaseProduct(completion: @escaping (Bool, Error?) -> Void) {

@@ -29,14 +29,24 @@ struct PageReorderView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
-                    Button {
-                        // Go back to scanner - pages are already synced via @Binding
-                        onBack()
-                        dismiss()
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "chevron.left")
-                            Text("Back")
+                    HStack(spacing: 16) {
+                        Button {
+                            onBack()
+                            dismiss()
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "chevron.left")
+                                Text("Back")
+                            }
+                        }
+                        Button(role: .destructive) {
+                            onCancel()
+                            dismiss()
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "xmark.circle")
+                                Text("Discard")
+                            }
                         }
                     }
                 }

@@ -460,7 +460,9 @@ struct SelectionBoxView: View {
     @State private var showWarning: Bool = false
     @State private var hasStartedDrag: Bool = false // Track if drag has started (minimum distance)
     
-    private let handleSize: CGFloat = 16.8  // 70% of previous 24
+    private var handleSize: CGFloat {
+        UIDevice.current.userInterfaceIdiom == .pad ? 28 : 16.8
+    }
     private let minSize: CGFloat = 40
     
     var body: some View {

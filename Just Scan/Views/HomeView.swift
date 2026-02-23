@@ -13,6 +13,7 @@ import UIKit
 struct HomeView: View {
     @StateObject private var documentService = DocumentService.shared
     @StateObject private var signatureService = SignatureService.shared
+    @StateObject private var storeManager = StoreManager.shared
     @State private var showScanner = false
     @State private var showSettings = false
     @State private var scannedImages: [UIImage]?
@@ -25,6 +26,11 @@ struct HomeView: View {
     @State private var newDocumentName = ""
     @State private var showPageReorder = false
     @State private var pagesToReorder: [UIImage] = []
+    @State private var showPaywall = false
+    @State private var pendingShareDocument: Document?
+    
+    /// Use full-screen presentation on iPad instead of sheet (avoids boxed pop-up)
+    private var isIPad: Bool { UIDevice.current.userInterfaceIdiom == .pad }
     
     private let gridSpacing: CGFloat = 12
     private let gridPadding: CGFloat = 16
@@ -90,133 +96,83 @@ struct HomeView: View {
                     }
                 }
             }
-            .sheet(isPresented: $showScanner) {
-                ZStack {
-                    DocumentScannerView(
-                        didFinishScanning: { images in
-                            // Only show reorder screen if we have pages
-                            guard !images.isEmpty else {
-                                print("⚠️ No pages scanned")
-                                // If we have existing pages, go back to review
-                                if !pagesToReorder.isEmpty {
-                                    showScanner = false
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-                                        showPageReorder = true
-                                    }
-                                }
-                                return
-                            }
-                            // If we already have pages (coming back from review), append new ones
-                            // Otherwise, start fresh
-                            if pagesToReorder.isEmpty {
-                                pagesToReorder = images
-                            } else {
-                                pagesToReorder.append(contentsOf: images)
-                            }
-                            // Close scanner sheet first
-                            showScanner = false
-                            // Wait for scanner to fully dismiss before showing reorder sheet
-                            // This prevents "only presenting a single sheet is supported" warning
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-                                if !pagesToReorder.isEmpty {
-                                    showPageReorder = true
-                                }
-                            }
-                        },
-                        didCancel: {
-                            // Scanner was cancelled - if we have existing pages, go back to review
-                            if !pagesToReorder.isEmpty {
-                                showScanner = false
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-                                    showPageReorder = true
-                                }
-                            }
-                        }
-                    )
-                    
-                    // Persistent banner showing existing pages (only when continuing session)
-                    if !pagesToReorder.isEmpty {
-                        VStack {
-                            HStack {
-                                Spacer()
-                                VStack(spacing: 4) {
-                                    HStack(spacing: 6) {
-                                        Image(systemName: "doc.on.doc.fill")
-                                            .font(.system(size: 14))
-                                            .foregroundColor(.white)
-                                        VStack(alignment: .leading, spacing: 1) {
-                                            Text("Continuing Session")
-                                                .font(.system(size: 9))
-                                                .fontWeight(.medium)
-                                                .foregroundColor(.white.opacity(0.9))
-                                            Text("\(pagesToReorder.count) page\(pagesToReorder.count == 1 ? "" : "s") already scanned")
-                                                .font(.system(size: 11))
-                                                .fontWeight(.bold)
-                                                .foregroundColor(.white)
-                                        }
-                                    }
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 8)
-                                    .background(
-                                        LinearGradient(
-                                            colors: [Color.blue, Color.blue.opacity(0.8)],
-                                            startPoint: .leading,
-                                            endPoint: .trailing
-                                        )
-                                    )
-                                    .cornerRadius(10)
-                                    .shadow(color: .black.opacity(0.3), radius: 6, x: 0, y: 3)
-                                    .scaleEffect(0.8)
-                                }
-                                Spacer()
-                            }
-                            .padding(.top, 50)
-                            Spacer()
-                        }
-                        .allowsHitTesting(false) // Don't block scanner interactions
-                    }
-                }
-                .interactiveDismissDisabled(true) // Prevent accidental swipe-to-dismiss
+            .sheet(isPresented: Binding(
+                get: { showScanner && !isIPad },
+                set: { if !$0 { showScanner = false } }
+            )) {
+                scannerContent
+            }
+            .fullScreenCover(isPresented: Binding(
+                get: { showScanner && isIPad },
+                set: { if !$0 { showScanner = false } }
+            )) {
+                scannerContent
             }
             .sheet(isPresented: Binding(
-                get: { showPageReorder && !pagesToReorder.isEmpty },
+                get: { showPageReorder && !pagesToReorder.isEmpty && !isIPad },
                 set: { newValue in
                     showPageReorder = newValue
-                    if !newValue {
-                        // Don't clear pages when dismissed - they might be going back to scanner
-                        // Only clear if explicitly cancelled
-                    }
                 }
             )) {
-                PageReorderView(
-                    pages: $pagesToReorder, // Use binding so changes sync automatically
-                    onSave: { reorderedPages in
-                        scannedImages = reorderedPages
-                        pagesToReorder = []
-                        showPageReorder = false
-                    },
-                    onBack: {
-                        // Go back to scanner - pages are already preserved in pagesToReorder via binding
-                        showPageReorder = false
-                        // Show scanner again after a brief delay
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                            showScanner = true
-                        }
-                    },
-                    onCancel: {
-                        // Full cancel - clear everything
-                        scannedImages = nil
-                        pagesToReorder = []
-                        showPageReorder = false
-                    }
-                )
-                .interactiveDismissDisabled(true) // Prevent accidental swipe-to-dismiss
+                pageReorderContent
+            }
+            .fullScreenCover(isPresented: Binding(
+                get: { showPageReorder && !pagesToReorder.isEmpty && isIPad },
+                set: { newValue in
+                    showPageReorder = newValue
+                }
+            )) {
+                pageReorderContent
             }
             .fullScreenCover(item: $selectedDocument) { document in
                 DocumentReviewView(document: document)
             }
-            .sheet(isPresented: $showSettings) {
+            .sheet(isPresented: Binding(
+                get: { showSettings && !isIPad },
+                set: { if !$0 { showSettings = false } }
+            )) {
                 SettingsView()
+            }
+            .fullScreenCover(isPresented: Binding(
+                get: { showSettings && isIPad },
+                set: { if !$0 { showSettings = false } }
+            )) {
+                SettingsView()
+            }
+            .sheet(isPresented: Binding(
+                get: { showPaywall && !isIPad },
+                set: { if !$0 { showPaywall = false } }
+            )) {
+                PaywallView(context: .export)
+                    .onDisappear {
+                        if storeManager.hasPurchased, let document = pendingShareDocument {
+                            pendingShareDocument = nil
+                            shareDocument(document)
+                        }
+                    }
+            }
+            .fullScreenCover(isPresented: Binding(
+                get: { showPaywall && isIPad },
+                set: { if !$0 { showPaywall = false } }
+            )) {
+                PaywallView(context: .export)
+                    .onDisappear {
+                        if storeManager.hasPurchased, let document = pendingShareDocument {
+                            pendingShareDocument = nil
+                            shareDocument(document)
+                        }
+                    }
+            }
+            .onChange(of: storeManager.hasPurchased) { hasPurchased in
+                // If purchase happens while paywall is open, auto-dismiss and retry
+                if hasPurchased && showPaywall, let document = pendingShareDocument {
+                    showPaywall = false
+                    // Small delay to ensure paywall dismisses first
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                        pendingShareDocument = nil
+                        shareDocument(document)
+                    }
+                }
             }
             .alert("Camera Permission Required", isPresented: $showCameraPermissionAlert) {
                 Button("Settings") {
@@ -266,7 +222,139 @@ struct HomeView: View {
         }
     }
     
+    // MARK: - Scanner & Page Reorder Content (shared for sheet vs fullScreenCover)
+    
+    @ViewBuilder
+    private var scannerContent: some View {
+        ZStack {
+            DocumentScannerView(
+                didFinishScanning: { images in
+                    guard !images.isEmpty else {
+                        if !pagesToReorder.isEmpty {
+                            showScanner = false
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                                showPageReorder = true
+                            }
+                        }
+                        return
+                    }
+                    if pagesToReorder.isEmpty {
+                        pagesToReorder = images
+                    } else {
+                        pagesToReorder.append(contentsOf: images)
+                    }
+                    showScanner = false
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                        if !pagesToReorder.isEmpty { showPageReorder = true }
+                    }
+                },
+                didCancel: {
+                    if !pagesToReorder.isEmpty {
+                        showScanner = false
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                            showPageReorder = true
+                        }
+                    } else {
+                        showScanner = false
+                    }
+                }
+            )
+            if !pagesToReorder.isEmpty {
+                VStack {
+                    HStack {
+                        Spacer()
+                        VStack(spacing: 4) {
+                            HStack(spacing: 6) {
+                                Image(systemName: "doc.on.doc.fill")
+                                    .font(.system(size: 14))
+                                    .foregroundColor(.white)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text("Continuing Session")
+                                        .font(.system(size: 9))
+                                        .fontWeight(.medium)
+                                        .foregroundColor(.white.opacity(0.9))
+                                    Text("\(pagesToReorder.count) page\(pagesToReorder.count == 1 ? "" : "s") already scanned")
+                                        .font(.system(size: 11))
+                                        .fontWeight(.bold)
+                                        .foregroundColor(.white)
+                                }
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .background(
+                                LinearGradient(
+                                    colors: [Color.blue, Color.blue.opacity(0.8)],
+                                    startPoint: .leading,
+                                    endPoint: .trailing
+                                )
+                            )
+                            .cornerRadius(10)
+                            .shadow(color: .black.opacity(0.3), radius: 6, x: 0, y: 3)
+                            .scaleEffect(0.8)
+                        }
+                        Spacer()
+                    }
+                    .padding(.top, 50)
+                    Spacer()
+                }
+                .allowsHitTesting(false)
+            }
+            if isIPad {
+                VStack {
+                    HStack {
+                        Button {
+                            showScanner = false
+                        } label: {
+                            Text("Cancel")
+                                .font(.body)
+                                .foregroundColor(.white)
+                        }
+                        .padding(.leading, 16)
+                        .padding(.top, 12)
+                        .padding(.bottom, 12)
+                        Spacer()
+                    }
+                    .background(Color.black.opacity(0.35))
+                    .frame(maxWidth: .infinity)
+                    Spacer()
+                }
+            }
+        }
+        .interactiveDismissDisabled(true)
+    }
+    
+    @ViewBuilder
+    private var pageReorderContent: some View {
+        PageReorderView(
+            pages: $pagesToReorder,
+            onSave: { reorderedPages in
+                scannedImages = reorderedPages
+                pagesToReorder = []
+                showPageReorder = false
+            },
+            onBack: {
+                showPageReorder = false
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    showScanner = true
+                }
+            },
+            onCancel: {
+                scannedImages = nil
+                pagesToReorder = []
+                showPageReorder = false
+            }
+        )
+        .interactiveDismissDisabled(true)
+    }
+    
     private func shareDocument(_ document: Document) {
+        // Check if user has purchased
+        guard storeManager.hasPurchased else {
+            pendingShareDocument = document
+            showPaywall = true
+            return
+        }
+        
         let activityVC = UIActivityViewController(activityItems: [document.fileURL], applicationActivities: nil)
         
         if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,

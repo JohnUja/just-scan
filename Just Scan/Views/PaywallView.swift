@@ -134,7 +134,11 @@ struct PaywallView: View {
 
                                 VStack(alignment: .trailing) {
                                     Text("Just Scan").font(.caption).foregroundColor(brightCyan)
-                                    Text("$9.99 Once").font(.title2).bold().foregroundColor(.white)
+                                    if let product = storeManager.products.first {
+                                        Text("\(product.displayPrice) Once").font(.title2).bold().foregroundColor(.white)
+                                    } else {
+                                        Text("Loading...").font(.title2).bold().foregroundColor(.white)
+                                    }
                                 }
                             }
 
@@ -194,21 +198,7 @@ struct PaywallView: View {
                             
                             // Secondary: Unlock Pro button (optional purchase)
                             Button {
-                                // Load products if needed, then attempt purchase
-                                if !storeManager.productsLoaded {
-                                    loadProductsIfNeeded()
-                                    // Wait a moment for products to load, then attempt purchase
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                                        if storeManager.productsLoaded {
-                                            attemptPurchase()
-                                        } else {
-                                            errorMessage = "Unable to connect to App Store. Please try again."
-                                            showError = true
-                                        }
-                                    }
-                                } else {
-                                    attemptPurchase()
-                                }
+                                attemptPurchase()
                             } label: {
                                 HStack {
                                     if isPurchasing {
@@ -222,7 +212,7 @@ struct PaywallView: View {
                                         if let product = storeManager.products.first {
                                             Text("Unlock Pro - \(product.displayPrice)")
                                         } else {
-                                            Text("Unlock Pro - $9.99")
+                                            Text("Unlock Pro")
                                         }
                                     }
                                 }
@@ -272,7 +262,7 @@ struct PaywallView: View {
                                         if let product = storeManager.products.first {
                                             Text("Unlock Export - \(product.displayPrice)")
                                         } else {
-                                            Text("Unlock Export - $9.99")
+                                            Text("Unlock Export")
                                     }
                                 }
                             }
@@ -368,68 +358,68 @@ struct PaywallView: View {
     private func loadProductsIfNeeded() {
         guard !storeManager.productsLoaded && !isLoadingProducts else { return }
         isLoadingProducts = true
-                storeManager.loadProducts()
         
-        // Set a timeout in case products don't load
-        DispatchQueue.main.asyncAfter(deadline: .now() + 10) {
-            if !storeManager.productsLoaded {
-                isLoadingProducts = false
+        Task { @MainActor in
+            defer { isLoadingProducts = false }
+            do {
+                try await storeManager.loadProducts()
+            } catch {
+                print("❌ Failed to load products: \(error.localizedDescription)")
             }
         }
     }
     
     private func attemptPurchase() {
-        // If products aren't loaded, try loading them first
-        if !storeManager.productsLoaded {
-            loadProductsIfNeeded()
+        Task { @MainActor in
+            isPurchasing = true
             
-            // Wait a bit for products to load, then retry
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-                if storeManager.productsLoaded {
-                    purchase()
-                } else {
-                    errorMessage = "Unable to connect to App Store. Please check your internet connection and try again."
-                    showError = true
+            do {
+                if !storeManager.productsLoaded {
+                    try await storeManager.loadProducts()
                 }
+                
+                guard storeManager.products.first != nil else {
+                    isPurchasing = false
+                    errorMessage = "Product not available. Please try again."
+                    showError = true
+                    return
+                }
+                
+                // purchase() will manage isPurchasing for the actual purchase flow
+                purchase() // purchase() calls storeManager.purchaseProduct(...)
+            } catch {
+                isPurchasing = false
+                errorMessage = "Unable to connect to the App Store. Please try again."
+                showError = true
             }
-            return
         }
-        
-        // Products are loaded, proceed with purchase
-        purchase()
     }
     
     private func purchase() {
-        // Guard: products must be loaded before purchase
         guard storeManager.productsLoaded else {
-            errorMessage = "Store not ready yet. Please wait a moment and try again."
+            isPurchasing = false
+            errorMessage = "Store not ready yet. Please wait and try again."
             showError = true
             return
         }
         
         guard !storeManager.products.isEmpty else {
+            isPurchasing = false
             errorMessage = "Product not available. Please try again later."
             showError = true
             return
         }
         
-        isPurchasing = true
+        // isPurchasing is already true from attemptPurchase()
         storeManager.purchaseProduct { success, error in
-            isPurchasing = false
+            self.isPurchasing = false
             if success {
                 dismiss()
             } else {
-                // Export context ALWAYS requires real purchase - no bypass allowed
-                if let error = error {
-                    let nsError = error as NSError
-                    if nsError.code == -2 {
-                        // User cancelled - don't show error
-                        return
-                    }
-                    errorMessage = error.localizedDescription
-                } else {
-                    errorMessage = "Purchase failed. Please try again."
+                if let error = error as NSError?, error.code == -2 {
+                    return // user cancelled
                 }
+                errorMessage = error?.localizedDescription ?? "Purchase failed. Please try again."
                 showError = true
             }
         }

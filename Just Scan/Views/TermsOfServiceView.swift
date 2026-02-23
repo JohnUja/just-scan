@@ -9,6 +9,7 @@ import SwiftUI
 
 struct TermsOfServiceView: View {
     @Environment(\.dismiss) var dismiss
+    @StateObject private var storeManager = StoreManager.shared
     
     var body: some View {
         NavigationStack {
@@ -32,9 +33,10 @@ struct TermsOfServiceView: View {
                         Just Scan is a document scanning application that allows users to scan, process, and manage documents using their iOS device. The App processes all data locally on your device and does not transmit data to external servers.
                         """)
                         
-                        SectionView(title: "3. One-Time Purchase", content: """
-                        Just Scan is available as a one-time purchase of $9.99. Upon purchase, you own the App and all its features permanently. No subscriptions or recurring charges will apply. This special offer is valid until July 2026.
-                        """)
+                        SectionView(title: "3. One-Time Purchase", content: {
+                            let priceText = storeManager.products.first?.displayPrice ?? "$9.99"
+                            return "Just Scan is available as a one-time purchase of \(priceText). Upon purchase, you own the App and all its features permanently. No subscriptions or recurring charges will apply. This special offer is valid until July 2026."
+                        }())
                         
                         SectionView(title: "4. Privacy", content: """
                         Just Scan processes all documents locally on your device. No data is transmitted to external servers. Camera access is used solely for document scanning purposes. Please refer to our Privacy Policy for more information.
@@ -69,6 +71,14 @@ struct TermsOfServiceView: View {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button("Done") {
                         dismiss()
+                    }
+                }
+            }
+            .onAppear {
+                // Load products to get the correct localized price
+                Task {
+                    if !storeManager.productsLoaded {
+                        try? await storeManager.loadProducts()
                     }
                 }
             }

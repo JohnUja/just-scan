@@ -54,6 +54,8 @@ struct DocumentReviewView: View {
     @State private var isExporting = false  // ✅ Export lock to prevent double-taps
     @StateObject private var storeManager = StoreManager.shared
     
+    private var isIPad: Bool { UIDevice.current.userInterfaceIdiom == .pad }
+    
     enum ExportType {
         case secure
         case flattened
@@ -188,13 +190,22 @@ struct DocumentReviewView: View {
                         ocrCoordinator.errorMessage = nil
                     }
                 }
-                .sheet(isPresented: $showPaywall) {
+                .sheet(isPresented: Binding(
+                    get: { showPaywall && !isIPad },
+                    set: { if !$0 { showPaywall = false } }
+                )) {
                     PaywallView(context: .export)
                         .onDisappear {
-                            // When paywall dismisses, check if purchase was successful and retry export
-                            if storeManager.hasPurchased {
-                                retryPendingExport()
-                            }
+                            if storeManager.hasPurchased { retryPendingExport() }
+                        }
+                }
+                .fullScreenCover(isPresented: Binding(
+                    get: { showPaywall && isIPad },
+                    set: { if !$0 { showPaywall = false } }
+                )) {
+                    PaywallView(context: .export)
+                        .onDisappear {
+                            if storeManager.hasPurchased { retryPendingExport() }
                         }
                 }
                 .onChange(of: storeManager.hasPurchased) { hasPurchased in
@@ -841,11 +852,6 @@ struct RotationHandleView: View {
         // Present iOS share sheet
         let activityVC = UIActivityViewController(activityItems: [url], applicationActivities: nil)
         
-        // For iPad, set popover presentation
-        if let popover = activityVC.popoverPresentationController {
-            popover.permittedArrowDirections = .any
-        }
-        
         // Find the topmost view controller to present from
         if let windowScene = UIApplication.shared.connectedScenes.first as? UIWindowScene,
            let window = windowScene.windows.first,
@@ -853,6 +859,12 @@ struct RotationHandleView: View {
             var topController = rootViewController
             while let presented = topController.presentedViewController {
                 topController = presented
+            }
+            // iPad: must set popover sourceView/sourceRect or presentation can crash
+            if UIDevice.current.userInterfaceIdiom == .pad, let popover = activityVC.popoverPresentationController {
+                popover.sourceView = topController.view
+                popover.sourceRect = CGRect(x: topController.view.bounds.midX, y: topController.view.bounds.midY, width: 0, height: 0)
+                popover.permittedArrowDirections = .any
             }
             topController.present(activityVC, animated: true)
             print("✅ Share sheet presented")

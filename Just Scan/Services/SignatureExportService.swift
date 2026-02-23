@@ -124,8 +124,9 @@ struct PDFExportHelper {
     }
     
     /// Apply color tint to a signature image
+    /// Note: Flip context when drawing CGImage so tinted result has same orientation as original.
+    /// (UIGraphicsImageRenderer is Y-down; CGImage draw uses bottom-left origin, so without flip the tinted image would be upside down in flattened export.)
     private static func applyColorTintToImage(_ image: UIImage, color: UIColor) -> UIImage {
-    // If black, return original (no tint needed)
     if color == .black {
         return image
     }
@@ -135,13 +136,16 @@ struct PDFExportHelper {
     let renderer = UIGraphicsImageRenderer(size: size)
     
     return renderer.image { context in
-        // Draw the color
-        context.cgContext.setFillColor(color.cgColor)
-        context.cgContext.fill(CGRect(origin: .zero, size: size))
-        
-        // Use destination-in blend mode to tint only the non-transparent parts
-        context.cgContext.setBlendMode(.destinationIn)
-        context.cgContext.draw(cgImage, in: CGRect(origin: .zero, size: size))
+        let ctx = context.cgContext
+        ctx.setFillColor(color.cgColor)
+        ctx.fill(CGRect(origin: .zero, size: size))
+        ctx.setBlendMode(.destinationIn)
+        // Flip so CGImage (bottom-left origin) is drawn right-way up into the renderer buffer (top-left origin)
+        ctx.saveGState()
+        ctx.translateBy(x: 0, y: size.height)
+        ctx.scaleBy(x: 1, y: -1)
+        ctx.draw(cgImage, in: CGRect(origin: .zero, size: size))
+        ctx.restoreGState()
     }
     }
 }
